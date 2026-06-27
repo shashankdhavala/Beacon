@@ -2,6 +2,7 @@ package com.beacon.workermvp
 
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,7 +22,7 @@ class ActivationServer(
             try {
                 ServerSocket(port).use { server ->
                     serverSocket = server
-                    log("Worker listening on port $port")
+                    log("Worker listening on port $port (persistent mode)")
 
                     while (running.get()) {
                         val socket = server.accept()
@@ -51,6 +52,9 @@ class ActivationServer(
     private fun handleClient(socket: Socket) {
         thread(name = "activation-client", isDaemon = true) {
             socket.use { client ->
+                client.tcpNoDelay = true
+                client.receiveBufferSize = 2 * 1024 * 1024
+                client.sendBufferSize = 2 * 1024 * 1024
                 val remote = "${client.inetAddress.hostAddress}:${client.port}"
                 log("Client connected: $remote")
 
@@ -58,25 +62,32 @@ class ActivationServer(
                     val input = DataInputStream(client.getInputStream().buffered())
                     val output = DataOutputStream(client.getOutputStream().buffered())
 
-                    val startedAt = System.nanoTime()
-                    val request = TensorProtocol.read(input)
-                    val receiveMs = (System.nanoTime() - startedAt) / 1_000_000.0
-                    log("Received ${request.summary()} read_ms=${"%.2f".format(receiveMs)}")
+                    while (running.get() && !client.isClosed) {
+                        val startedAt = System.nanoTime()
+                        val request = try {
+                            TensorProtocol.read(input)
+                        } catch (_: EOFException) {
+                            log("Client closed: $remote")
+                            break
+                        }
+                        val receiveMs = (System.nanoTime() - startedAt) / 1_000_000.0
+                        log("Received ${request.summary()} read_ms=${"%.2f".format(receiveMs)}")
 
-                    // MVP behavior: echo the exact tensor bytes back as a RESULT.
-                    // Later this is where ExecuTorch shard B will run.
-                    val response = TensorPayload(
-                        messageType = "RESULT",
-                        requestId = request.requestId,
-                        step = request.step,
-                        sourceShard = request.targetShard,
-                        targetShard = request.sourceShard,
-                        shape = request.shape,
-                        dtype = request.dtype,
-                        bytes = request.bytes,
-                    )
-                    TensorProtocol.write(output, response)
-                    log("Sent ${response.summary()}")
+                        // MVP behavior: echo the exact tensor bytes back as a RESULT.
+                        // Later this is where ExecuTorch shard B will run.
+                        val response = TensorPayload(
+                            messageType = "RESULT",
+                            requestId = request.requestId,
+                            step = request.step,
+                            sourceShard = request.targetShard,
+                            targetShard = request.sourceShard,
+                            shape = request.shape,
+                            dtype = request.dtype,
+                            bytes = request.bytes,
+                        )
+                        TensorProtocol.write(output, response)
+                        log("Sent ${response.summary()}")
+                    }
                 } catch (error: Exception) {
                     log("Client error: ${error.message}")
                 }

@@ -25,7 +25,7 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "Beacon Worker MVP"
+            text = "Beacon Worker MVP\npersistent TCP build"
             textSize = 24f
         }
         root.addView(title)

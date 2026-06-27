@@ -145,6 +145,25 @@ If the Mac cannot connect:
 - Check that no VPN/firewall is isolating local network devices.
 - On some networks, client isolation blocks phone-to-laptop traffic. Use a phone hotspot or another router.
 
+## USB / ADB Forwarding Fallback
+
+If the phone is connected to the Mac with USB debugging, you can avoid WiFi routing completely.
+
+1. Start the Android worker server in the app.
+2. On the Mac, run:
+
+```bash
+adb forward tcp:9000 tcp:9000
+```
+
+3. Then connect to localhost:
+
+```bash
+python3 tools/mac_coordinator.py --host 127.0.0.1 --port 9000
+```
+
+This maps Mac port `9000` to Android device port `9000`.
+
 ## Next Integration Step
 
 Replace the echo block in:
