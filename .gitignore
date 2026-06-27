@@ -1,0 +1,36 @@
+# Android
+*.apk
+*.aab
+*.dex
+*.class
+local.properties
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ExecuTorch / model artifacts
+*.pte
+*.bin
+*.safetensors
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and benchmarks
+*.log
+benchmark_results/
