@@ -31,7 +31,7 @@ class MainActivity : Activity() {
         root.addView(title)
 
         val ipLabel = TextView(this).apply {
-            text = "Phone IP: ${localIpv4Address() ?: "connect to WiFi first"}"
+            text = "Phone IPs:\n${localIpv4AddressSummary()}"
             textSize = 18f
             setPadding(0, 24, 0, 16)
         }
@@ -51,7 +51,7 @@ class MainActivity : Activity() {
                 server?.stop()
                 server = ActivationServer(port) { line -> appendLog(line) }
                 server?.start()
-                appendLog("Use this from Mac: python3 tools/mac_coordinator.py --host ${localIpv4Address()} --port $port")
+                appendLog("Use this from Mac: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port")
             }
         }
         root.addView(startButton)
@@ -94,17 +94,44 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun localIpv4Address(): String? {
+    private fun preferredLocalIpv4Address(): String? {
+        return localIpv4Addresses().firstOrNull()?.address
+    }
+
+    private fun localIpv4AddressSummary(): String {
+        val addresses = localIpv4Addresses()
+        if (addresses.isEmpty()) return "connect to WiFi first"
+        return addresses.joinToString(separator = "\n") { "${it.interfaceName}: ${it.address}" }
+    }
+
+    private fun localIpv4Addresses(): List<AddressInfo> {
+        val result = mutableListOf<AddressInfo>()
         val interfaces = NetworkInterface.getNetworkInterfaces().toList()
         for (networkInterface in interfaces) {
             if (!networkInterface.isUp || networkInterface.isLoopback) continue
             val addresses = networkInterface.inetAddresses.toList()
             for (address in addresses) {
                 if (address is Inet4Address && !address.isLoopbackAddress) {
-                    return address.hostAddress
+                    result += AddressInfo(networkInterface.name, address.hostAddress)
                 }
             }
         }
-        return null
+        return result.sortedWith(
+            compareBy<AddressInfo> {
+                when {
+                    it.interfaceName == "wlan0" -> 0
+                    it.interfaceName.startsWith("wlan") -> 1
+                    it.interfaceName.startsWith("ap") -> 2
+                    it.interfaceName.startsWith("swlan") -> 3
+                    it.interfaceName.startsWith("rmnet") -> 9
+                    else -> 5
+                }
+            }.thenBy { it.interfaceName },
+        )
     }
 }
+
+data class AddressInfo(
+    val interfaceName: String,
+    val address: String,
+)
