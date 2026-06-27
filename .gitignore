@@ -12,9 +12,12 @@ captures/
 
 # ExecuTorch / model artifacts
 *.pte
+*.pt2
 *.bin
 *.safetensors
 *.gguf
+artifacts/
+models/
 
 # Python
 __pycache__/
