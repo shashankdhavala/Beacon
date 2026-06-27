@@ -10,6 +10,10 @@ import kotlin.concurrent.thread
 
 class ActivationServer(
     private val port: Int,
+    private val appendSuffix: String,
+    private val nextHost: String?,
+    private val nextPort: Int,
+    private val connectTimeoutMs: Int = 5_000,
     private val log: (String) -> Unit,
 ) {
     private val running = AtomicBoolean(false)
@@ -22,7 +26,12 @@ class ActivationServer(
             try {
                 ServerSocket(port).use { server ->
                     serverSocket = server
-                    log("Worker listening on port $port (diagnostic persistent mode)")
+                    val route = if (nextHost.isNullOrBlank()) {
+                        "terminal node"
+                    } else {
+                        "forwarding to $nextHost:$nextPort"
+                    }
+                    log("Worker listening on port $port (diagnostic persistent mode, append='$appendSuffix', $route)")
 
                     while (running.get()) {
                         val socket = server.accept()
@@ -74,20 +83,18 @@ class ActivationServer(
                         val receiveMs = (System.nanoTime() - startedAt) / 1_000_000.0
                         log("Received ${request.summary()} read_ms=${"%.2f".format(receiveMs)}")
 
-                        // MVP behavior: echo the exact tensor bytes back as a RESULT.
-                        // Later this is where ExecuTorch shard B will run.
-                        val response = TensorPayload(
-                            messageType = "RESULT",
-                            requestId = request.requestId,
-                            step = request.step,
-                            sourceShard = request.targetShard,
-                            targetShard = request.sourceShard,
-                            shape = request.shape,
-                            dtype = request.dtype,
-                            bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
-                            responseMode = request.responseMode,
-                            includeChecksum = request.includeChecksum,
-                        )
+                        val response = if (request.messageType == "TEXT") {
+                            handleTextRoute(request)
+                        } else {
+                            // MVP behavior: echo the exact tensor bytes back as a RESULT.
+                            // Later this is where ExecuTorch shard B will run.
+                            request.copy(
+                                messageType = "RESULT",
+                                sourceShard = request.targetShard,
+                                targetShard = request.sourceShard,
+                                bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
+                            )
+                        }
                         TensorProtocol.write(output, response)
                         log("Sent ${response.summary()}")
                     }
@@ -95,6 +102,49 @@ class ActivationServer(
                     log("Client error: ${error.message}")
                 }
             }
+        }
+    }
+
+    private fun handleTextRoute(request: TensorPayload): TensorPayload {
+        val incomingText = request.bytes.toString(Charsets.UTF_8)
+        val appendedText = incomingText + appendSuffix
+        val appendedBytes = appendedText.toByteArray(Charsets.UTF_8)
+        log("Text route: '$incomingText' -> '$appendedText'")
+
+        val appendedPayload = request.copy(
+            messageType = "TEXT",
+            step = request.step + 1,
+            sourceShard = request.targetShard,
+            targetShard = request.targetShard + 1,
+            shape = intArrayOf(appendedBytes.size),
+            dtype = "utf8",
+            bytes = appendedBytes,
+        )
+
+        val host = nextHost?.takeIf { it.isNotBlank() }
+        if (host == null) {
+            return appendedPayload.copy(messageType = "RESULT")
+        }
+
+        log("Forwarding text request=${request.requestId} to $host:$nextPort")
+        return forwardOnce(host, nextPort, appendedPayload)
+    }
+
+    private fun forwardOnce(host: String, port: Int, payload: TensorPayload): TensorPayload {
+        Socket().use { socket ->
+            socket.tcpNoDelay = true
+            socket.keepAlive = false
+            socket.receiveBufferSize = 2 * 1024 * 1024
+            socket.sendBufferSize = 2 * 1024 * 1024
+            socket.connect(java.net.InetSocketAddress(host, port), connectTimeoutMs)
+            socket.soTimeout = connectTimeoutMs
+
+            val input = DataInputStream(socket.getInputStream().buffered())
+            val output = DataOutputStream(socket.getOutputStream().buffered())
+            TensorProtocol.write(output, payload)
+            val response = TensorProtocol.read(input)
+            log("Forward response ${response.summary()}")
+            return response
         }
     }
 }

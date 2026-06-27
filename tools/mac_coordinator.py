@@ -3,8 +3,8 @@
 MacBook coordinator for the Beacon/ClassMesh networking MVP.
 
 Run this on the Mac. It connects to the Android worker TCP server,
-sends one fake activation tensor, waits for a response tensor, and
-prints latency/checksum information.
+sends one fake activation tensor or text route message, waits for a
+response, and prints latency/checksum information.
 """
 
 from __future__ import annotations
@@ -101,9 +101,10 @@ def fake_fp16_tensor_bytes(num_values: int) -> bytes:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Send a fake tensor to an Android worker.")
+    parser = argparse.ArgumentParser(description="Send a fake tensor or text route message to Android workers.")
     parser.add_argument("--host", required=True, help="Android phone IP address shown in the worker app")
     parser.add_argument("--port", type=int, default=9000, help="Android worker port")
+    parser.add_argument("--message", help="Send this UTF-8 text instead of a fake tensor, e.g. hello")
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "float16"])
@@ -160,7 +161,10 @@ def main() -> None:
         print("Summary:")
         print(f"trials={len(latencies_ms)}")
         print(f"mode={'persistent' if args.persistent else 'one_connection_per_trial'}")
-        print(f"shape={shape} dtype={args.dtype} bytes_each_direction={response_sizes[0]}")
+        if args.message is None:
+            print(f"shape={shape} dtype={args.dtype} bytes_each_direction={response_sizes[0]}")
+        else:
+            print(f"message={args.message!r} response_bytes={response_sizes[0]}")
         print(f"min_ms={min(latencies_ms):.2f}")
         print(f"p50_ms={percentile(latencies_ms, 50):.2f}")
         print(f"p95_ms={percentile(latencies_ms, 95):.2f}")
@@ -176,6 +180,22 @@ def run_one_iteration(
     latencies_ms: list[float],
     response_sizes: list[int],
 ) -> None:
+    if args.message is not None:
+        message_bytes = args.message.encode("utf-8")
+        request_id = f"mac-text-{int(time.time() * 1000)}-{trial}"
+        msg = TensorMessage(
+            message_type="TEXT",
+            request_id=request_id,
+            step=trial,
+            source_shard=0,
+            target_shard=1,
+            shape=[len(message_bytes)],
+            dtype="utf8",
+            bytes_data=message_bytes,
+            response_mode=args.response_mode,
+            checksum=args.checksum,
+        )
+    else:
         tensor_bytes = fake_fp16_tensor_bytes(num_values)
         request_id = f"mac-{int(time.time() * 1000)}-{trial}"
         msg = TensorMessage(
@@ -191,28 +211,30 @@ def run_one_iteration(
             checksum=args.checksum,
         )
 
-        if persistent_sock is None:
-            print(f"Connecting to Android worker at {args.host}:{args.port} ...")
-        try:
-            response_header, response_body, elapsed_ms = run_trial(args, msg, persistent_sock)
-        except TimeoutError:
-            print_connection_help(args.host, args.port, "connection timed out")
-            sys.exit(2)
-        except OSError as error:
-            reason = error.strerror or str(error)
-            if error.errno == errno.ECONNREFUSED:
-                reason = "connection refused"
-            print_connection_help(args.host, args.port, reason)
-            sys.exit(2)
+    if persistent_sock is None:
+        print(f"Connecting to Android worker at {args.host}:{args.port} ...")
+    try:
+        response_header, response_body, elapsed_ms = run_trial(args, msg, persistent_sock)
+    except TimeoutError:
+        print_connection_help(args.host, args.port, "connection timed out")
+        sys.exit(2)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        if error.errno == errno.ECONNREFUSED:
+            reason = "connection refused"
+        print_connection_help(args.host, args.port, reason)
+        sys.exit(2)
 
-        latencies_ms.append(elapsed_ms)
-        response_sizes.append(len(response_body))
-        print("Received response:")
-        print(json.dumps(response_header, indent=2))
-        print(f"response bytes={len(response_body)} sha256={sha256_hex(response_body)[:12]}")
-        print(f"round_trip_ms={elapsed_ms:.2f}")
-        if trial != args.repeat - 1 and args.delay_ms > 0:
-            time.sleep(args.delay_ms / 1000.0)
+    latencies_ms.append(elapsed_ms)
+    response_sizes.append(len(response_body))
+    print("Received response:")
+    print(json.dumps(response_header, indent=2))
+    print(f"response bytes={len(response_body)} sha256={sha256_hex(response_body)[:12]}")
+    if response_header.get("dtype") == "utf8":
+        print(f"response text={response_body.decode('utf-8')!r}")
+    print(f"round_trip_ms={elapsed_ms:.2f}")
+    if trial != args.repeat - 1 and args.delay_ms > 0:
+        time.sleep(args.delay_ms / 1000.0)
 
 
 def run_trial(
@@ -220,12 +242,20 @@ def run_trial(
     msg: TensorMessage,
     persistent_sock: socket.socket | None = None,
 ) -> tuple[dict[str, Any], bytes, float]:
-    print(
-        "Sending tensor "
-        f"request={msg.request_id} shape={msg.shape} dtype={msg.dtype} "
-        f"bytes={len(msg.bytes_data)} response_mode={msg.response_mode} checksum={msg.checksum} "
-        f"sha256={sha256_hex(msg.bytes_data)[:12]}"
-    )
+    if msg.dtype == "utf8":
+        print(
+            "Sending text "
+            f"request={msg.request_id} text={msg.bytes_data.decode('utf-8')!r} "
+            f"bytes={len(msg.bytes_data)} response_mode={msg.response_mode} checksum={msg.checksum} "
+            f"sha256={sha256_hex(msg.bytes_data)[:12]}"
+        )
+    else:
+        print(
+            "Sending tensor "
+            f"request={msg.request_id} shape={msg.shape} dtype={msg.dtype} "
+            f"bytes={len(msg.bytes_data)} response_mode={msg.response_mode} checksum={msg.checksum} "
+            f"sha256={sha256_hex(msg.bytes_data)[:12]}"
+        )
     if persistent_sock is not None:
         start = time.perf_counter()
         send_tensor(persistent_sock, msg)

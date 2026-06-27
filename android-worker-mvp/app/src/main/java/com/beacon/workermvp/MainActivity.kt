@@ -14,6 +14,9 @@ import java.net.NetworkInterface
 class MainActivity : Activity() {
     private lateinit var logView: TextView
     private lateinit var portInput: EditText
+    private lateinit var appendInput: EditText
+    private lateinit var nextHostInput: EditText
+    private lateinit var nextPortInput: EditText
     private var server: ActivationServer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,14 +47,43 @@ class MainActivity : Activity() {
         }
         root.addView(portInput)
 
+        appendInput = EditText(this).apply {
+            setText("1")
+            hint = "Append suffix for text route, e.g. 1 or 2"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        root.addView(appendInput)
+
+        nextHostInput = EditText(this).apply {
+            hint = "Next phone IP (leave blank on last phone)"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        root.addView(nextHostInput)
+
+        nextPortInput = EditText(this).apply {
+            setText("9000")
+            hint = "Next phone port"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        root.addView(nextPortInput)
+
         val startButton = Button(this).apply {
             text = "Start Worker Server"
             setOnClickListener {
                 val port = portInput.text.toString().toIntOrNull() ?: 9000
+                val appendSuffix = appendInput.text.toString()
+                val nextHost = nextHostInput.text.toString().trim().ifBlank { null }
+                val nextPort = nextPortInput.text.toString().toIntOrNull() ?: 9000
                 server?.stop()
-                server = ActivationServer(port) { line -> appendLog(line) }
+                server = ActivationServer(
+                    port = port,
+                    appendSuffix = appendSuffix,
+                    nextHost = nextHost,
+                    nextPort = nextPort,
+                ) { line -> appendLog(line) }
                 server?.start()
-                appendLog("Use this from Mac: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port")
+                appendLog("Use tensor test: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port")
+                appendLog("Use text route: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port --message hello")
             }
         }
         root.addView(startButton)
