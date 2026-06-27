@@ -15,6 +15,8 @@ data class TensorPayload(
     val shape: IntArray,
     val dtype: String,
     val bytes: ByteArray,
+    val responseMode: String = "echo",
+    val includeChecksum: Boolean = true,
 ) {
     fun toHeaderJson(): JSONObject {
         return JSONObject()
@@ -26,14 +28,16 @@ data class TensorPayload(
             .put("shape", JSONArray(shape.toList()))
             .put("dtype", dtype)
             .put("byteLength", bytes.size)
-            .put("sha256", sha256Hex(bytes))
+            .put("sha256", if (includeChecksum) sha256Hex(bytes) else "")
+            .put("responseMode", responseMode)
             .put("createdAtMs", System.currentTimeMillis())
     }
 
     fun summary(): String {
+        val checksum = if (includeChecksum) sha256Hex(bytes).take(12) else "disabled"
         return "type=$messageType request=$requestId step=$step " +
             "source=$sourceShard target=$targetShard shape=${shape.contentToString()} " +
-            "dtype=$dtype bytes=${bytes.size} sha256=${sha256Hex(bytes).take(12)}"
+            "dtype=$dtype bytes=${bytes.size} sha256=$checksum responseMode=$responseMode"
     }
 }
 
@@ -53,9 +57,11 @@ object TensorProtocol {
         input.readFully(body)
 
         val expectedSha = header.optString("sha256", "")
-        val actualSha = sha256Hex(body)
-        require(expectedSha.isEmpty() || expectedSha == actualSha) {
-            "checksum mismatch expected=$expectedSha actual=$actualSha"
+        if (expectedSha.isNotEmpty()) {
+            val actualSha = sha256Hex(body)
+            require(expectedSha == actualSha) {
+                "checksum mismatch expected=$expectedSha actual=$actualSha"
+            }
         }
 
         return TensorPayload(
@@ -67,6 +73,8 @@ object TensorProtocol {
             shape = header.getJSONArray("shape").toIntArray(),
             dtype = header.getString("dtype"),
             bytes = body,
+            responseMode = header.optString("responseMode", "echo"),
+            includeChecksum = expectedSha.isNotEmpty(),
         )
     }
 

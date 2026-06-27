@@ -35,9 +35,11 @@ class TensorMessage:
     shape: list[int]
     dtype: str
     bytes_data: bytes
+    response_mode: str = "echo"
+    checksum: str = "sha256"
 
     def header(self) -> dict[str, Any]:
-        return {
+        header = {
             "messageType": self.message_type,
             "requestId": self.request_id,
             "step": self.step,
@@ -46,9 +48,11 @@ class TensorMessage:
             "shape": self.shape,
             "dtype": self.dtype,
             "byteLength": len(self.bytes_data),
-            "sha256": sha256_hex(self.bytes_data),
+            "responseMode": self.response_mode,
             "createdAtMs": int(time.time() * 1000),
         }
+        header["sha256"] = sha256_hex(self.bytes_data) if self.checksum == "sha256" else ""
+        return header
 
 
 def sha256_hex(data: bytes) -> str:
@@ -107,6 +111,8 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=1, help="Number of request/response trials")
     parser.add_argument("--delay-ms", type=float, default=0.0, help="Delay between repeated trials")
     parser.add_argument("--persistent", action="store_true", help="Reuse one TCP connection for repeated trials")
+    parser.add_argument("--response-mode", default="echo", choices=["echo", "ack"], help="Android response body mode")
+    parser.add_argument("--checksum", default="sha256", choices=["sha256", "none"], help="Checksum mode")
     args = parser.parse_args()
 
     shape = [1, args.seq_len, args.hidden_size]
@@ -123,6 +129,7 @@ def main() -> None:
         try:
             sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
             sock.settimeout(args.timeout)
+            configure_socket(sock)
         except TimeoutError:
             print_connection_help(args.host, args.port, "connection timed out")
             sys.exit(2)
@@ -180,6 +187,8 @@ def run_one_iteration(
             shape=shape,
             dtype=args.dtype,
             bytes_data=tensor_bytes,
+            response_mode=args.response_mode,
+            checksum=args.checksum,
         )
 
         if persistent_sock is None:
@@ -214,7 +223,8 @@ def run_trial(
     print(
         "Sending tensor "
         f"request={msg.request_id} shape={msg.shape} dtype={msg.dtype} "
-        f"bytes={len(msg.bytes_data)} sha256={sha256_hex(msg.bytes_data)[:12]}"
+        f"bytes={len(msg.bytes_data)} response_mode={msg.response_mode} checksum={msg.checksum} "
+        f"sha256={sha256_hex(msg.bytes_data)[:12]}"
     )
     if persistent_sock is not None:
         start = time.perf_counter()
@@ -225,6 +235,7 @@ def run_trial(
 
     with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
         sock.settimeout(args.timeout)
+        configure_socket(sock)
         start = time.perf_counter()
         send_tensor(sock, msg)
         response_header, response_body = recv_tensor(sock)
@@ -241,6 +252,12 @@ def percentile(values: list[float], pct: float) -> float:
     upper = min(lower + 1, len(sorted_values) - 1)
     weight = rank - lower
     return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def configure_socket(sock: socket.socket) -> None:
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
 
 
 def print_connection_help(host: str, port: int, reason: str) -> None:

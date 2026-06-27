@@ -22,7 +22,7 @@ class ActivationServer(
             try {
                 ServerSocket(port).use { server ->
                     serverSocket = server
-                    log("Worker listening on port $port (persistent mode)")
+                    log("Worker listening on port $port (diagnostic persistent mode)")
 
                     while (running.get()) {
                         val socket = server.accept()
@@ -53,6 +53,7 @@ class ActivationServer(
         thread(name = "activation-client", isDaemon = true) {
             socket.use { client ->
                 client.tcpNoDelay = true
+                client.keepAlive = false
                 client.receiveBufferSize = 2 * 1024 * 1024
                 client.sendBufferSize = 2 * 1024 * 1024
                 val remote = "${client.inetAddress.hostAddress}:${client.port}"
@@ -83,7 +84,9 @@ class ActivationServer(
                             targetShard = request.sourceShard,
                             shape = request.shape,
                             dtype = request.dtype,
-                            bytes = request.bytes,
+                            bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
+                            responseMode = request.responseMode,
+                            includeChecksum = request.includeChecksum,
                         )
                         TensorProtocol.write(output, response)
                         log("Sent ${response.summary()}")
