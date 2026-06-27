@@ -135,6 +135,68 @@ For fp16, this sends:
 1 * 128 * 3200 * 2 = 819200 bytes
 ```
 
+## Two-Phone Text Route Test
+
+Use this when the Mac and both phones are connected to the same hotspot.
+
+### Phone 2, the last mobile node
+
+Start this one first.
+
+```text
+Port: 9000
+Append suffix: 2
+Next phone IP: leave blank
+Next phone port: 9000
+```
+
+Tap:
+
+```text
+Start Worker Server
+```
+
+Note Phone 2's `wlan0` IP address from the app.
+
+### Phone 1, the first mobile node
+
+Configure Phone 1 to point at Phone 2.
+
+```text
+Port: 9000
+Append suffix: 1
+Next phone IP: <Phone 2 wlan0 IP>
+Next phone port: 9000
+```
+
+Tap:
+
+```text
+Start Worker Server
+```
+
+Note Phone 1's `wlan0` IP address from the app.
+
+### MacBook
+
+Send `hello` to Phone 1:
+
+```bash
+python3 tools/mac_coordinator.py --host <Phone 1 wlan0 IP> --port 9000 --message hello
+```
+
+Expected Mac output includes:
+
+```text
+response text='hello12'
+```
+
+Route:
+
+```text
+Mac -> Phone 1 appends 1 -> Phone 2 appends 2 -> Phone 1 -> Mac
+```
+
 ## Troubleshooting
 
 If the Mac cannot connect:
