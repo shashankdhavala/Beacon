@@ -111,7 +111,12 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=1, help="Number of request/response trials")
     parser.add_argument("--delay-ms", type=float, default=0.0, help="Delay between repeated trials")
     parser.add_argument("--persistent", action="store_true", help="Reuse one TCP connection for repeated trials")
-    parser.add_argument("--response-mode", default="echo", choices=["echo", "ack"], help="Android response body mode")
+    parser.add_argument(
+        "--response-mode",
+        default="echo",
+        choices=["echo", "ack", "fake_result"],
+        help="Android response body mode",
+    )
     parser.add_argument("--checksum", default="sha256", choices=["sha256", "none"], help="Checksum mode")
     args = parser.parse_args()
 
@@ -122,6 +127,7 @@ def main() -> None:
 
     latencies_ms: list[float] = []
     response_sizes: list[int] = []
+    request_size = num_values * 2
 
     sock: socket.socket | None = None
     if args.persistent:
@@ -160,7 +166,9 @@ def main() -> None:
         print("Summary:")
         print(f"trials={len(latencies_ms)}")
         print(f"mode={'persistent' if args.persistent else 'one_connection_per_trial'}")
-        print(f"shape={shape} dtype={args.dtype} bytes_each_direction={response_sizes[0]}")
+        print(f"shape={shape} dtype={args.dtype}")
+        print(f"request_bytes={request_size}")
+        print(f"response_bytes={response_sizes[0]}")
         print(f"min_ms={min(latencies_ms):.2f}")
         print(f"p50_ms={percentile(latencies_ms, 50):.2f}")
         print(f"p95_ms={percentile(latencies_ms, 95):.2f}")
@@ -210,6 +218,9 @@ def run_one_iteration(
         print("Received response:")
         print(json.dumps(response_header, indent=2))
         print(f"response bytes={len(response_body)} sha256={sha256_hex(response_body)[:12]}")
+        if response_header.get("dtype") == "int32" and len(response_body) == 4:
+            token_id = struct.unpack("<i", response_body)[0]
+            print(f"fake_token_id={token_id}")
         print(f"round_trip_ms={elapsed_ms:.2f}")
         if trial != args.repeat - 1 and args.delay_ms > 0:
             time.sleep(args.delay_ms / 1000.0)

@@ -3,6 +3,8 @@ package com.beacon.workermvp
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
@@ -76,15 +78,28 @@ class ActivationServer(
 
                         // MVP behavior: echo the exact tensor bytes back as a RESULT.
                         // Later this is where ExecuTorch shard B will run.
+                        val responseBody = when (request.responseMode) {
+                            "ack" -> ByteArray(0)
+                            "fake_result" -> fakeTokenBytes(request.step)
+                            else -> request.bytes
+                        }
+                        val responseShape = when (request.responseMode) {
+                            "fake_result" -> intArrayOf(1)
+                            else -> request.shape
+                        }
+                        val responseDtype = when (request.responseMode) {
+                            "fake_result" -> "int32"
+                            else -> request.dtype
+                        }
                         val response = TensorPayload(
                             messageType = "RESULT",
                             requestId = request.requestId,
                             step = request.step,
                             sourceShard = request.targetShard,
                             targetShard = request.sourceShard,
-                            shape = request.shape,
-                            dtype = request.dtype,
-                            bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
+                            shape = responseShape,
+                            dtype = responseDtype,
+                            bytes = responseBody,
                             responseMode = request.responseMode,
                             includeChecksum = request.includeChecksum,
                         )
@@ -96,5 +111,13 @@ class ActivationServer(
                 }
             }
         }
+    }
+
+    private fun fakeTokenBytes(step: Int): ByteArray {
+        val fakeTokenId = 10_000 + step
+        return ByteBuffer.allocate(Int.SIZE_BYTES)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(fakeTokenId)
+            .array()
     }
 }
