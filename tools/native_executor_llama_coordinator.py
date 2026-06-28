@@ -15,6 +15,8 @@ import socket
 import struct
 import sys
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -40,13 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-dir", default="artifacts/llama32_3b_sm8750_3way")
     parser.add_argument("--model-id", default=None)
     parser.add_argument("--route", required=True, help='e.g. "1=10.0.0.11:9100,2=10.0.0.12:9100,3=10.0.0.13:9100"')
-    parser.add_argument("--prompt", default="hello")
-    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--default-max-new-tokens", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--system", default=None)
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument("--listen-port", type=int, default=9301)
     return parser.parse_args()
 
 
@@ -89,6 +94,177 @@ def float32_bytes_to_tensor(body: bytes, device: str, hidden_size: int) -> torch
     return torch.from_numpy(array).to(device)
 
 
+class NativeExecutorLlamaCoordinatorService:
+    def __init__(
+        self,
+        route_arg: str,
+        artifact_dir: str,
+        model_id: str | None,
+        timeout: float,
+        device: str,
+        dtype: str,
+        default_max_new_tokens: int,
+        chat_template: bool,
+        system: str | None,
+    ) -> None:
+        self.manifest = load_manifest(artifact_dir)
+        architecture = self.manifest.get("architecture") or self.manifest.get("shards", [{}])[0].get("architecture")
+        if architecture != "llama":
+            raise ValueError(f"expected llama manifest, got architecture={architecture!r}")
+
+        self.route = parse_route(route_arg)
+        if len(self.route) != int(self.manifest["num_devices"]):
+            raise ValueError(f"manifest expects {self.manifest['num_devices']} shards, got route with {len(self.route)}")
+
+        self.hidden_size = int(self.manifest.get("hidden_size", 3072))
+        self.model_id = model_id or self.manifest["model_id"]
+        self.timeout = timeout
+        self.device = device
+        self.dtype = dtype
+        self.default_max_new_tokens = default_max_new_tokens
+        self.chat_template = chat_template
+        self.system = system
+        self.max_cache_len = int(self.manifest["max_cache_len"])
+
+        print(f"[native-coordinator] loading tokenizer from {self.model_id}", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        print(f"[native-coordinator] loading model from {self.model_id}", flush=True)
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype=parse_torch_dtype(dtype)).to(device)
+        self.model.eval()
+
+        self.sockets: list[tuple[int, socket.socket]] = []
+        for shard_id, host, port in self.route:
+            print(f"[native-coordinator] connecting to shard_{shard_id} at {host}:{port}", flush=True)
+            sock = socket.create_connection((host, port), timeout=timeout)
+            sock.settimeout(timeout)
+            configure(sock)
+            send_bridge(sock, MSG_RESET, 0, 0)
+            self.sockets.append((shard_id, sock))
+        print("[native-coordinator] ready", flush=True)
+
+    def close(self) -> None:
+        for _, sock in self.sockets:
+            sock.close()
+        self.sockets = []
+
+    def reset_all(self) -> None:
+        for _, sock in self.sockets:
+            send_bridge(sock, MSG_RESET, 0, 0)
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int | None = None,
+        chat_template: bool | None = None,
+        system: str | None = None,
+    ) -> dict[str, Any]:
+        if not prompt:
+            raise ValueError("prompt must be non-empty")
+        token_budget = self.default_max_new_tokens if max_new_tokens is None else int(max_new_tokens)
+        if token_budget <= 0:
+            raise ValueError("max_new_tokens must be positive")
+
+        prompt_ids = tokenize_prompt(
+            self.tokenizer,
+            prompt,
+            self.chat_template if chat_template is None else bool(chat_template),
+            self.system if system is None else system,
+            self.device,
+        )
+        prompt_len = int(prompt_ids.shape[1])
+        if prompt_len + token_budget > self.max_cache_len:
+            raise ValueError(
+                f"prompt tokens ({prompt_len}) + max_new_tokens ({token_budget}) exceeds "
+                f"max_cache_len ({self.max_cache_len})"
+            )
+
+        generated_ids: list[int] = prompt_ids[0].detach().cpu().tolist()
+        predicted_next: int | None = None
+        trials: list[dict[str, Any]] = []
+        latencies_ms: list[float] = []
+        eos_token_id = self.tokenizer.eos_token_id
+        started_at = time.time()
+
+        self.reset_all()
+        try:
+            with torch.inference_mode():
+                for step in range(prompt_len + token_budget):
+                    if step < prompt_len:
+                        token = prompt_ids[:, step : step + 1]
+                        token_id = int(token.item())
+                        phase = "prefill"
+                    else:
+                        if predicted_next is None:
+                            raise RuntimeError("decode step reached before predicted token was available")
+                        token_id = predicted_next
+                        token = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
+                        phase = "decode"
+
+                    hidden = self.model.model.embed_tokens(token)
+                    body = tensor_to_float32_bytes(hidden)
+
+                    step_started = time.perf_counter()
+                    current = body
+                    for _, sock in self.sockets:
+                        current = send_bridge(sock, MSG_STEP, step, step + 1, current)
+                    elapsed_ms = (time.perf_counter() - step_started) * 1000.0
+                    latencies_ms.append(elapsed_ms)
+
+                    final_hidden = float32_bytes_to_tensor(current, self.device, self.hidden_size)
+                    logits = self.model.lm_head(self.model.model.norm(final_hidden))
+                    predicted_next = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+                    kept = step >= prompt_len - 1
+                    if kept:
+                        generated_ids.append(predicted_next)
+
+                    trials.append(
+                        {
+                            "step": step,
+                            "phase": phase,
+                            "inputTokenId": token_id,
+                            "inputTokenText": self.tokenizer.decode([token_id], skip_special_tokens=False),
+                            "predictedTokenId": predicted_next,
+                            "predictedTokenText": self.tokenizer.decode([predicted_next], skip_special_tokens=False),
+                            "kept": kept,
+                            "requestBytes": len(body),
+                            "responseBytes": len(current),
+                            "latencyMs": elapsed_ms,
+                        }
+                    )
+                    if phase == "decode" and eos_token_id is not None and predicted_next == int(eos_token_id):
+                        break
+                    if len(generated_ids) >= prompt_len + token_budget:
+                        break
+        finally:
+            try:
+                self.reset_all()
+            except Exception as exc:
+                print(f"[native-coordinator] reset failed: {exc}", flush=True)
+
+        output_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return {
+            "ok": True,
+            "mode": "llama",
+            "modelId": self.model_id,
+            "route": ",".join(f"{sid}={host}:{port}" for sid, host, port in self.route),
+            "routeHops": [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in self.route],
+            "prompt": prompt,
+            "promptTokenIds": prompt_ids[0].detach().cpu().tolist(),
+            "generatedTokenIds": generated_ids,
+            "promptTokenCount": prompt_len,
+            "generatedTokenCount": max(len(generated_ids) - prompt_len, 0),
+            "output": output_text,
+            "durationMs": int((time.time() - started_at) * 1000),
+            "trials": trials,
+            "summary": {
+                "minMs": min(latencies_ms) if latencies_ms else 0.0,
+                "p50Ms": percentile(latencies_ms, 50) if latencies_ms else 0.0,
+                "p95Ms": percentile(latencies_ms, 95) if latencies_ms else 0.0,
+                "maxMs": max(latencies_ms) if latencies_ms else 0.0,
+            },
+        }
+
+
 def execute_native_route(
     route_arg: str,
     prompt: str,
@@ -101,123 +277,74 @@ def execute_native_route(
     chat_template: bool,
     system: str | None,
 ) -> dict[str, Any]:
-    manifest = load_manifest(artifact_dir)
-    architecture = manifest.get("architecture") or manifest.get("shards", [{}])[0].get("architecture")
-    if architecture != "llama":
-        raise ValueError(f"expected llama manifest, got architecture={architecture!r}")
-
-    route = parse_route(route_arg)
-    if len(route) != int(manifest["num_devices"]):
-        raise ValueError(f"manifest expects {manifest['num_devices']} shards, got route with {len(route)}")
-
-    hidden_size = int(manifest.get("hidden_size", 3072))
-    resolved_model_id = model_id or manifest["model_id"]
-    tokenizer = AutoTokenizer.from_pretrained(resolved_model_id)
-    model = AutoModelForCausalLM.from_pretrained(resolved_model_id, dtype=parse_torch_dtype(dtype)).to(device)
-    model.eval()
-
-    prompt_ids = tokenize_prompt(tokenizer, prompt, chat_template, system, device)
-    prompt_len = int(prompt_ids.shape[1])
-    max_cache_len = int(manifest["max_cache_len"])
-    if prompt_len + max_new_tokens > max_cache_len:
-        raise ValueError(f"prompt tokens ({prompt_len}) + max_new_tokens ({max_new_tokens}) exceeds max_cache_len ({max_cache_len})")
-
-    sockets: list[tuple[int, socket.socket]] = []
+    service = NativeExecutorLlamaCoordinatorService(
+        route_arg=route_arg,
+        artifact_dir=artifact_dir,
+        model_id=model_id,
+        timeout=timeout,
+        device=device,
+        dtype=dtype,
+        default_max_new_tokens=max_new_tokens,
+        chat_template=chat_template,
+        system=system,
+    )
     try:
-        for shard_id, host, port in route:
-            sock = socket.create_connection((host, port), timeout=timeout)
-            sock.settimeout(timeout)
-            configure(sock)
-            send_bridge(sock, MSG_RESET, 0, 0)
-            sockets.append((shard_id, sock))
-
-        generated_ids: list[int] = prompt_ids[0].detach().cpu().tolist()
-        predicted_next: int | None = None
-        trials: list[dict[str, Any]] = []
-        latencies_ms: list[float] = []
-        eos_token_id = tokenizer.eos_token_id
-
-        with torch.no_grad():
-            for step in range(prompt_len + max_new_tokens):
-                if step < prompt_len:
-                    token = prompt_ids[:, step : step + 1]
-                    token_id = int(token.item())
-                    phase = "prefill"
-                else:
-                    if predicted_next is None:
-                        raise RuntimeError("decode step reached before predicted token was available")
-                    token_id = predicted_next
-                    token = torch.tensor([[token_id]], dtype=torch.long, device=device)
-                    phase = "decode"
-
-                hidden = model.model.embed_tokens(token)
-                body = tensor_to_float32_bytes(hidden)
-
-                started = time.perf_counter()
-                current = body
-                for _, sock in sockets:
-                    current = send_bridge(sock, MSG_STEP, step, step + 1, current)
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                latencies_ms.append(elapsed_ms)
-
-                final_hidden = float32_bytes_to_tensor(current, device, hidden_size)
-                logits = model.lm_head(model.model.norm(final_hidden))
-                predicted_next = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-                kept = step >= prompt_len - 1
-                if kept:
-                    generated_ids.append(predicted_next)
-
-                trials.append(
-                    {
-                        "step": step,
-                        "phase": phase,
-                        "inputTokenId": token_id,
-                        "inputTokenText": tokenizer.decode([token_id], skip_special_tokens=False),
-                        "predictedTokenId": predicted_next,
-                        "predictedTokenText": tokenizer.decode([predicted_next], skip_special_tokens=False),
-                        "kept": kept,
-                        "requestBytes": len(body),
-                        "responseBytes": len(current),
-                        "latencyMs": elapsed_ms,
-                    }
-                )
-                if phase == "decode" and eos_token_id is not None and predicted_next == int(eos_token_id):
-                    break
-                if len(generated_ids) >= prompt_len + max_new_tokens:
-                    break
-
-        output_text = tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        return {
-            "modelId": resolved_model_id,
-            "route": route_arg,
-            "prompt": prompt,
-            "output": output_text,
-            "trials": trials,
-            "summary": {
-                "minMs": min(latencies_ms) if latencies_ms else 0.0,
-                "p50Ms": percentile(latencies_ms, 50) if latencies_ms else 0.0,
-                "p95Ms": percentile(latencies_ms, 95) if latencies_ms else 0.0,
-                "maxMs": max(latencies_ms) if latencies_ms else 0.0,
-            },
-        }
+        return service.generate(prompt, max_new_tokens=max_new_tokens, chat_template=chat_template, system=system)
     finally:
-        for _, sock in sockets:
-            sock.close()
+        service.close()
 
 
-def main() -> None:
-    args = parse_args()
-    result = execute_native_route(
-        route_arg=args.route,
+class CoordinatorRequestHandler(BaseHTTPRequestHandler):
+    service: NativeExecutorLlamaCoordinatorService
+
+    def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self._write_json(HTTPStatus.OK, {"status": "ok"})
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/generate":
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(content_length)
+        try:
+            request = json.loads(payload.decode("utf-8"))
+            result = self.service.generate(
+                prompt=str(request.get("prompt", "")),
+                max_new_tokens=request.get("max_new_tokens"),
+                system=request.get("system"),
+                chat_template=request.get("chat_template"),
+            )
+            print(
+                f"[native-coordinator] prompt_tokens={result['promptTokenCount']} "
+                f"generated_tokens={result['generatedTokenCount']} duration_ms={result['durationMs']}",
+                flush=True,
+            )
+            print(f"[native-coordinator] output: {result['output']}", flush=True)
+            self._write_json(HTTPStatus.OK, result)
+        except Exception as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def run_oneshot(service: NativeExecutorLlamaCoordinatorService, args: argparse.Namespace) -> None:
+    result = service.generate(
         prompt=args.prompt,
-        artifact_dir=args.artifact_dir,
-        model_id=args.model_id,
         max_new_tokens=args.max_new_tokens,
-        timeout=args.timeout,
-        device=args.device,
-        dtype=args.dtype,
-        chat_template=args.chat_template,
         system=args.system,
+        chat_template=args.chat_template,
     )
     print(f"Model: {result['modelId']}")
     print(f"Route: {result['route']}")
@@ -239,6 +366,36 @@ def main() -> None:
         f"steps={len(result['trials'])} p50_ms={result['summary']['p50Ms']:.2f} "
         f"p95_ms={result['summary']['p95Ms']:.2f} max_ms={result['summary']['maxMs']:.2f}"
     )
+
+
+def run_server(service: NativeExecutorLlamaCoordinatorService, host: str, port: int) -> None:
+    CoordinatorRequestHandler.service = service
+    server = HTTPServer((host, port), CoordinatorRequestHandler)
+    print(f"[native-coordinator] listening on http://{host}:{port}", flush=True)
+    server.serve_forever()
+
+
+def main() -> None:
+    args = parse_args()
+    service = NativeExecutorLlamaCoordinatorService(
+        route_arg=args.route,
+        artifact_dir=args.artifact_dir,
+        model_id=args.model_id,
+        timeout=args.timeout,
+        device=args.device,
+        dtype=args.dtype,
+        default_max_new_tokens=args.default_max_new_tokens,
+        chat_template=args.chat_template,
+        system=args.system,
+    )
+    if args.prompt is not None:
+        run_oneshot(service, args)
+        service.close()
+        return
+    try:
+        run_server(service, args.listen_host, args.listen_port)
+    finally:
+        service.close()
 
 
 if __name__ == "__main__":
