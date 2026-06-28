@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Export GPT-2 shard artifacts for local multi-device ExecuTorch testing.
+Export GPT-2 or Llama shard artifacts for local multi-device ExecuTorch testing.
 """
 
 from __future__ import annotations
@@ -14,8 +14,22 @@ from typing import List, Sequence, Tuple
 import torch
 import torch.nn as nn
 from executorch.exir import to_edge
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+try:
+    from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset
+    from executorch.backends.qualcomm.utils.utils import (
+        generate_htp_compiler_spec,
+        generate_qnn_executorch_compiler_spec,
+        to_edge_transform_and_lower_to_qnn,
+    )
+except ImportError:
+    QcomChipset = None
+    generate_htp_compiler_spec = None
+    generate_qnn_executorch_compiler_spec = None
+    to_edge_transform_and_lower_to_qnn = None
 
 
 def prepare_attention_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -81,7 +95,31 @@ class FixedSizeTensorCache:
         return layer.keys, layer.values
 
 
-class GPT2DecodeOnlyShard(nn.Module):
+def is_gpt2_model(model) -> bool:
+    return isinstance(model, GPT2LMHeadModel)
+
+
+def is_llama_model(model) -> bool:
+    return isinstance(model, LlamaForCausalLM)
+
+
+def get_hidden_size(model) -> int:
+    if is_gpt2_model(model):
+        return int(model.config.n_embd)
+    if is_llama_model(model):
+        return int(model.config.hidden_size)
+    raise TypeError(f"Unsupported model type: {type(model)}")
+
+
+def get_num_layers(model) -> int:
+    if is_gpt2_model(model):
+        return len(model.transformer.h)
+    if is_llama_model(model):
+        return len(model.model.layers)
+    raise TypeError(f"Unsupported model type: {type(model)}")
+
+
+class GPT2BlockShard(nn.Module):
     def __init__(
         self,
         full_model: GPT2LMHeadModel,
@@ -154,6 +192,79 @@ class GPT2DecodeOnlyShard(nn.Module):
         return (output, *cache_outputs)
 
 
+class LlamaBlockShard(nn.Module):
+    def __init__(
+        self,
+        full_model: LlamaForCausalLM,
+        start_idx: int,
+        end_idx: int,
+        max_cache_len: int,
+    ):
+        super().__init__()
+        self.core = full_model.model
+        self.blocks = nn.ModuleList(self.core.layers[start_idx:end_idx])
+        self.layer_ids = [block.self_attn.layer_idx for block in self.blocks]
+        self.max_cache_len = max_cache_len
+        self.has_blocks = len(self.blocks) > 0
+
+    def _allocate_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        num_kv_heads = self.blocks[0].self_attn.config.num_key_value_heads
+        head_dim = self.blocks[0].self_attn.head_dim
+        keys = [
+            torch.zeros(batch_size, num_kv_heads, self.max_cache_len, head_dim, device=device, dtype=dtype)
+            for _ in range(len(self.blocks))
+        ]
+        values = [
+            torch.zeros(batch_size, num_kv_heads, self.max_cache_len, head_dim, device=device, dtype=dtype)
+            for _ in range(len(self.blocks))
+        ]
+        return keys, values
+
+    @staticmethod
+    def _flatten_cache(cache: FixedSizeTensorCache) -> tuple[torch.Tensor, ...]:
+        flat: List[torch.Tensor] = []
+        for layer in cache.layers:
+            flat.extend([layer.keys.contiguous(), layer.values.contiguous()])
+        return tuple(flat)
+
+    def forward(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        hidden_states, attention_mask, position_ids, cache_position, *past_kv = args
+
+        if self.has_blocks:
+            if len(past_kv) == 0:
+                keys, values = self._allocate_cache(
+                    batch_size=hidden_states.shape[0],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            else:
+                keys = list(past_kv[0::2])
+                values = list(past_kv[1::2])
+            cache = FixedSizeTensorCache(self.layer_ids, keys, values, cache_position)
+            block_attention_mask = prepare_attention_mask(attention_mask, hidden_states.dtype)
+            position_embeddings = self.core.rotary_emb(hidden_states, position_ids)
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=block_attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=True,
+                    position_embeddings=position_embeddings,
+                )
+            cache_outputs = self._flatten_cache(cache)
+        else:
+            cache_outputs = ()
+
+        output = hidden_states.contiguous()
+        return (output, *cache_outputs)
+
+
 @dataclass
 class ShardArtifactPath:
     path: str
@@ -163,6 +274,8 @@ class ShardArtifactPath:
 class ShardManifest:
     shard_index: int
     artifact_path: str
+    architecture: str
+    export_backend: str
     start_layer: int
     end_layer: int
     num_layers: int
@@ -174,64 +287,88 @@ class ShardManifest:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export GPT-2 ExecuTorch shard artifacts")
     parser.add_argument("--model-id", default="gpt2")
-    parser.add_argument("--prompt", default="Beacon helps coordinate offline medical guidance.")
     parser.add_argument("--num-devices", type=int, default=3)
     parser.add_argument("--artifact-dir", default="artifacts/gpt2")
     parser.add_argument("--max-cache-len", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=4)
+    parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument(
+        "--qnn",
+        action="store_true",
+        help="Export Qualcomm QNN-backed ExecuTorch artifacts for SM8750",
+    )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(model_id: str, device: str) -> tuple[GPT2LMHeadModel, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id)
-    if not isinstance(model, GPT2LMHeadModel):
-        raise TypeError(f"Expected a GPT-2 style model, got {type(model)}")
+def parse_torch_dtype(dtype_name: str) -> torch.dtype:
+    return getattr(torch, dtype_name)
+
+
+def load_model(model_id: str, device: str, dtype_name: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=parse_torch_dtype(dtype_name),
+    )
+    if not (is_gpt2_model(model) or is_llama_model(model)):
+        raise TypeError(f"Expected a GPT-2 or Llama model, got {type(model)}")
     model.to(device)
     model.eval()
-    return model, tokenizer
+    return model
+
+
+def ensure_qualcomm_export_available() -> None:
+    if (
+        QcomChipset is None
+        or generate_htp_compiler_spec is None
+        or generate_qnn_executorch_compiler_spec is None
+        or to_edge_transform_and_lower_to_qnn is None
+    ):
+        raise ImportError(
+            "Qualcomm ExecuTorch export is unavailable. Install Qualcomm backend dependencies, "
+            "including `py-cpuinfo`, in the active environment."
+        )
 
 
 def build_shard_modules(
-    model: GPT2LMHeadModel,
+    model,
     layer_ranges: Sequence[Tuple[int, int]],
     max_cache_len: int,
-) -> List[GPT2DecodeOnlyShard]:
-    return [
-        GPT2DecodeOnlyShard(
-            model,
-            start,
-            end,
-            max_cache_len,
-        ).eval()
-        for start, end in layer_ranges
-    ]
+):
+    modules = []
+    for start, end in layer_ranges:
+        if is_gpt2_model(model):
+            modules.append(GPT2BlockShard(model, start, end, max_cache_len).eval())
+        elif is_llama_model(model):
+            modules.append(LlamaBlockShard(model, start, end, max_cache_len).eval())
+        else:
+            raise TypeError(f"Unsupported model type: {type(model)}")
+    return modules
 
 
 def build_export_examples(
-    model: GPT2LMHeadModel,
-    tokenizer: AutoTokenizer,
-    prompt: str,
+    model,
     layer_ranges: Sequence[Tuple[int, int]],
     max_cache_len: int,
     device: str,
-) -> Tuple[List[GPT2DecodeOnlyShard], List[tuple[torch.Tensor, ...]]]:
+) -> Tuple[List[nn.Module], List[tuple[torch.Tensor, ...]]]:
     modules = build_shard_modules(model, layer_ranges, max_cache_len)
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
-    first_token = input_ids[:, :1]
-    position_ids = torch.tensor([[0]], dtype=torch.long, device=device)
-    hidden_states = model.transformer.wte(first_token) + model.transformer.wpe(position_ids)
-    hidden_states = model.transformer.drop(hidden_states)
+    hidden_size = get_hidden_size(model)
+    hidden_states = torch.zeros(1, 1, hidden_size, dtype=model.dtype, device=device)
     attention_mask = make_fixed_attention_mask(1, max_cache_len, device)
+    position_ids = torch.tensor([[0]], dtype=torch.long, device=device)
     cache_position = torch.tensor([0], dtype=torch.long, device=device)
 
     args_list: List[tuple[torch.Tensor, ...]] = []
     current = hidden_states
     for module in modules:
         if module.has_blocks:
-            num_heads = module.blocks[0].attn.num_heads
-            head_dim = module.blocks[0].attn.head_dim
+            if is_gpt2_model(model):
+                num_heads = module.blocks[0].attn.num_heads
+                head_dim = module.blocks[0].attn.head_dim
+            else:
+                num_heads = module.blocks[0].self_attn.config.num_key_value_heads
+                head_dim = module.blocks[0].self_attn.head_dim
             keys = [
                 torch.zeros(1, num_heads, max_cache_len, head_dim, device=device, dtype=model.dtype)
                 for _ in range(len(module.blocks))
@@ -244,7 +381,10 @@ def build_export_examples(
         else:
             cache_args = ()
 
-        shard_args = (current, attention_mask, cache_position, *cache_args)
+        if is_gpt2_model(model):
+            shard_args = (current, attention_mask, cache_position, *cache_args)
+        else:
+            shard_args = (current, attention_mask, position_ids, cache_position, *cache_args)
         args_list.append(shard_args)
         current = module(*shard_args)[0]
     return modules, args_list
@@ -258,16 +398,35 @@ def export_to_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
     return str(output_path)
 
 
+def export_to_qnn_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
+    ensure_qualcomm_export_available()
+
+    backend_options = generate_htp_compiler_spec(use_fp16=True)
+    compile_spec = generate_qnn_executorch_compiler_spec(
+        soc_model=QcomChipset.SM8750,
+        backend_options=backend_options,
+    )
+    program = to_edge_transform_and_lower_to_qnn(module.eval(), args, compile_spec).to_executorch()
+    with open(output_path, "wb") as fp:
+        fp.write(program.buffer)
+    return str(output_path)
+
+
 def export_artifacts(
     modules: Sequence[nn.Module],
     args_list: Sequence[tuple[torch.Tensor, ...]],
     artifact_dir: Path,
+    use_qnn: bool,
 ) -> List[ShardArtifactPath]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     paths: List[ShardArtifactPath] = []
     for idx, (module, args) in enumerate(zip(modules, args_list)):
         output_path = (artifact_dir / f"shard_{idx}.pte").resolve()
-        paths.append(ShardArtifactPath(path=export_to_pte(module, args, output_path)))
+        if use_qnn:
+            path = export_to_qnn_pte(module, args, output_path)
+        else:
+            path = export_to_pte(module, args, output_path)
+        paths.append(ShardArtifactPath(path=path))
     return paths
 
 
@@ -277,15 +436,21 @@ def write_manifest(
     num_devices: int,
     max_cache_len: int,
     model_dtype: torch.dtype,
+    architecture: str,
+    export_backend: str,
     layer_ranges: Sequence[Tuple[int, int]],
-    modules: Sequence[GPT2DecodeOnlyShard],
+    modules: Sequence[nn.Module],
     artifact_paths: Sequence[ShardArtifactPath],
 ) -> Path:
     shards: List[dict] = []
     for idx, (layer_range, module, artifact_path) in enumerate(zip(layer_ranges, modules, artifact_paths)):
         if module.has_blocks:
-            num_heads = module.blocks[0].attn.num_heads
-            head_dim = module.blocks[0].attn.head_dim
+            if architecture == "gpt2":
+                num_heads = module.blocks[0].attn.num_heads
+                head_dim = module.blocks[0].attn.head_dim
+            else:
+                num_heads = module.blocks[0].self_attn.config.num_key_value_heads
+                head_dim = module.blocks[0].self_attn.head_dim
         else:
             num_heads = 0
             head_dim = 0
@@ -298,6 +463,8 @@ def write_manifest(
             ShardManifest(
                 shard_index=idx,
                 artifact_path=artifact_path.path,
+                architecture=architecture,
+                export_backend=export_backend,
                 start_layer=layer_range[0],
                 end_layer=layer_range[1],
                 num_layers=layer_range[1] - layer_range[0],
@@ -312,6 +479,8 @@ def write_manifest(
         "artifact_dir": str(artifact_dir.resolve()),
         "num_devices": num_devices,
         "max_cache_len": max_cache_len,
+        "export_backend": export_backend,
+        "qualcomm_chipset": "SM8750" if export_backend == "qnn:SM8750" else None,
         "layer_ranges": [list(r) for r in layer_ranges],
         "shards": shards,
     }
@@ -324,35 +493,39 @@ def main() -> None:
     args = parse_args()
     torch.set_grad_enabled(False)
 
-    model, tokenizer = load_model_and_tokenizer(args.model_id, args.device)
-    num_layers = len(model.transformer.h)
+    if args.qnn:
+        ensure_qualcomm_export_available()
+
+    model = load_model(args.model_id, args.device, args.dtype)
+    architecture = "gpt2" if is_gpt2_model(model) else "llama"
+    num_layers = get_num_layers(model)
     if args.num_devices < 2:
         raise ValueError("num_devices must be at least 2")
-
-    prompt_len = int(tokenizer(args.prompt, return_tensors="pt")["input_ids"].shape[1])
-    required_cache_len = prompt_len + args.max_new_tokens
-    if args.max_cache_len < required_cache_len:
-        raise ValueError(
-            f"max_cache_len={args.max_cache_len} is too small for prompt_len={prompt_len} "
-            f"and max_new_tokens={args.max_new_tokens}"
-        )
+    if args.qnn and args.dtype != "float16":
+        raise ValueError("--qnn currently requires --dtype float16")
 
     layer_ranges = compute_layer_ranges(num_layers, args.num_devices)
     modules, args_list = build_export_examples(
         model=model,
-        tokenizer=tokenizer,
-        prompt=args.prompt,
         layer_ranges=layer_ranges,
         max_cache_len=args.max_cache_len,
         device=args.device,
     )
-    artifact_paths = export_artifacts(modules, args_list, Path(args.artifact_dir))
+    export_backend = "qnn:SM8750" if args.qnn else "portable"
+    artifact_paths = export_artifacts(
+        modules,
+        args_list,
+        Path(args.artifact_dir),
+        args.qnn,
+    )
     manifest_path = write_manifest(
         artifact_dir=Path(args.artifact_dir),
         model_id=args.model_id,
         num_devices=args.num_devices,
         max_cache_len=args.max_cache_len,
         model_dtype=model.dtype,
+        architecture=architecture,
+        export_backend=export_backend,
         layer_ranges=layer_ranges,
         modules=modules,
         artifact_paths=artifact_paths,
@@ -363,6 +536,7 @@ def main() -> None:
     print(f"Num devices: {args.num_devices}")
     print(f"Layer ranges: {layer_ranges}")
     print(f"Max cache len: {args.max_cache_len}")
+    print(f"Export backend: {export_backend}")
     print("Artifacts:")
     for artifact in artifact_paths:
         print(f"  {artifact.path}")

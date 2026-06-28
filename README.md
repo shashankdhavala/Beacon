@@ -293,6 +293,7 @@ Files:
 What `scripts/export_shards.py` does:
 - loads a GPT-2 style causal LM
 - splits transformer layers evenly across `num_devices`
+- builds zero-valued example tensors with the correct shapes for export
 - exports one decode-style `.pte` artifact per shard
 - writes `manifest.json` with shard metadata for the worker processes
 - writes:
@@ -310,7 +311,7 @@ What `scripts/run_master.py` does:
 - connects only to shard 0
 - teacher-forces prompt tokens through the worker chain
 - appends generated tokens autoregressively after the prompt
-- checks greedy generation parity against the unsplit model
+- prints the final generated text
 
 Run:
 

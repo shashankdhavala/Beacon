@@ -16,6 +16,7 @@ captures/
 *.safetensors
 *.gguf
 models/
+artifacts/
 
 # Python
 __pycache__/

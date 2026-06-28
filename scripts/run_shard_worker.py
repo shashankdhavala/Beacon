@@ -71,6 +71,7 @@ class ShardWorker:
         self.max_cache_len = int(manifest["max_cache_len"])
         self.num_devices = int(manifest["num_devices"])
         self.is_last = shard_index == self.num_devices - 1
+        self.architecture = shard_info["architecture"]
         self.num_layers = int(shard_info["num_layers"])
         self.num_heads = int(shard_info["num_heads"])
         self.head_dim = int(shard_info["head_dim"])
@@ -97,6 +98,7 @@ class ShardWorker:
         while True:
             try:
                 sock = socket.create_connection((self.downstream_host, self.downstream_port), timeout=5)
+                sock.settimeout(None)
                 self.downstream_sock = sock
                 self.log(f"connected downstream to {self.downstream_host}:{self.downstream_port}")
                 return
@@ -160,9 +162,15 @@ class ShardWorker:
             f"step_hidden: step={step} current_length={current_length} hidden_shape={tuple(hidden_states.shape)}"
         )
         attention_mask = make_fixed_attention_mask(current_length, self.max_cache_len, self.device)
+        position_ids = torch.tensor([[step]], dtype=torch.long, device=self.device)
         cache_position = torch.tensor([step], dtype=torch.long, device=self.device)
         cache = self.require_cache()
-        outputs = self.shard.forward((hidden_states, attention_mask, cache_position, *cache))
+        if self.architecture == "gpt2":
+            outputs = self.shard.forward((hidden_states, attention_mask, cache_position, *cache))
+        elif self.architecture == "llama":
+            outputs = self.shard.forward((hidden_states, attention_mask, position_ids, cache_position, *cache))
+        else:
+            raise ValueError(f"Unsupported architecture: {self.architecture}")
         self.kv_cache = tuple(t.to(self.device) for t in outputs[1:])
         current = outputs[0].to(self.device)
         if self.is_last:
