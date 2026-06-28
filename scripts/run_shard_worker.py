@@ -77,6 +77,7 @@ class ShardWorker:
         self.head_dim = int(shard_info["head_dim"])
         self.cache_dtype = getattr(torch, shard_info["cache_dtype"])
         self.device = device
+        self.expected_cache_tensors = self.num_layers * 2
         artifact_path = Path(shard_info["artifact_path"])
         if not artifact_path.is_absolute():
             artifact_path = (Path(manifest["artifact_dir"]) / artifact_path).resolve()
@@ -85,9 +86,29 @@ class ShardWorker:
         self.downstream_host = downstream_host
         self.downstream_port = downstream_port
         self.downstream_sock: Optional[socket.socket] = None
+        self.attention_masks = [
+            make_fixed_attention_mask(length, self.max_cache_len, self.device)
+            for length in range(self.max_cache_len + 1)
+        ]
+        self.position_ids = [
+            torch.tensor([[step]], dtype=torch.long, device=self.device)
+            for step in range(self.max_cache_len)
+        ]
+        self.cache_positions = [
+            torch.tensor([step], dtype=torch.long, device=self.device)
+            for step in range(self.max_cache_len)
+        ]
 
     def log(self, message: str) -> None:
         print(f"[shard_{self.shard_index}] {message}", flush=True)
+
+    def warn(self, message: str) -> None:
+        print(f"[shard_{self.shard_index}] warning: {message}", flush=True)
+
+    def to_device_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if str(tensor.device) == self.device:
+            return tensor
+        return tensor.to(self.device)
 
     def connect_downstream(self) -> None:
         if self.is_last:
@@ -99,6 +120,7 @@ class ShardWorker:
             try:
                 sock = socket.create_connection((self.downstream_host, self.downstream_port), timeout=5)
                 sock.settimeout(None)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.downstream_sock = sock
                 self.log(f"connected downstream to {self.downstream_host}:{self.downstream_port}")
                 return
@@ -155,15 +177,19 @@ class ShardWorker:
         return self.kv_cache
 
     def handle_step_hidden(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        hidden_states = message["hidden_states"].to(self.device)
+        hidden_states = self.to_device_tensor(message["hidden_states"])
         step = int(message["step"])
         current_length = int(message["current_length"])
+        if current_length != step + 1:
+            self.warn(
+                f"expected current_length == step + 1, got step={step} current_length={current_length}"
+            )
         self.log(
             f"step_hidden: step={step} current_length={current_length} hidden_shape={tuple(hidden_states.shape)}"
         )
-        attention_mask = make_fixed_attention_mask(current_length, self.max_cache_len, self.device)
-        position_ids = torch.tensor([[step]], dtype=torch.long, device=self.device)
-        cache_position = torch.tensor([step], dtype=torch.long, device=self.device)
+        attention_mask = self.attention_masks[current_length]
+        position_ids = self.position_ids[step]
+        cache_position = self.cache_positions[step]
         cache = self.require_cache()
         if self.architecture == "gpt2":
             outputs = self.shard.forward((hidden_states, attention_mask, cache_position, *cache))
@@ -171,25 +197,23 @@ class ShardWorker:
             outputs = self.shard.forward((hidden_states, attention_mask, position_ids, cache_position, *cache))
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
-        hidden_index = next(
-            (index for index, tensor in enumerate(outputs) if tuple(tensor.shape) == tuple(hidden_states.shape)),
-            None,
-        )
-        if hidden_index is None:
-            hidden_index = next((index for index, tensor in enumerate(outputs) if len(tensor.shape) == 3), None)
-        if hidden_index is None:
+        if len(outputs) == 0:
             raise RuntimeError(
-                f"shard_{self.shard_index} did not return a hidden tensor; "
+                f"shard_{self.shard_index} returned no outputs"
+            )
+        current = self.to_device_tensor(outputs[0])
+        cache_tensors = tuple(self.to_device_tensor(tensor) for tensor in outputs[1 : 1 + self.expected_cache_tensors])
+        if len(cache_tensors) != self.expected_cache_tensors:
+            self.warn(
+                f"expected {self.expected_cache_tensors} cache tensors, got {len(cache_tensors)}; "
                 f"outputs={[tuple(t.shape) for t in outputs]}"
             )
-
-        cache_tensors = [
-            tensor.to(self.device)
-            for index, tensor in enumerate(outputs)
-            if index != hidden_index and len(tensor.shape) == 4
-        ][: self.num_layers * 2]
-        self.kv_cache = tuple(cache_tensors)
-        current = outputs[hidden_index].to(self.device)
+        self.kv_cache = cache_tensors
+        if cache_tensors:
+            self.log(
+                f"updated local KV cache: slot={step} filled={current_length}/{self.max_cache_len} "
+                f"tensor_shape={tuple(cache_tensors[0].shape)}"
+            )
         if self.is_last:
             self.log(f"produced hidden_states for master: shape={tuple(current.shape)}")
             return {"type": "step_result", "hidden_states": current.cpu()}
@@ -241,6 +265,7 @@ def main() -> None:
 
     while True:
         conn, addr = server.accept()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         worker.log(f"accepted upstream connection from {addr}")
         with conn:
             while True:

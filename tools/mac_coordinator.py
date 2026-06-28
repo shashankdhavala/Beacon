@@ -19,7 +19,14 @@ import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 HEADER_LEN_STRUCT = struct.Struct(">I")
@@ -104,8 +111,106 @@ def fake_fp16_tensor_bytes(num_values: int) -> bytes:
     return bytes(values)
 
 
+def parse_torch_dtype(dtype_name: str) -> torch.dtype:
+    return getattr(torch, dtype_name)
+
+
+def load_manifest(artifact_dir: str) -> dict[str, Any]:
+    manifest_path = Path(artifact_dir) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["manifest_dir"] = str(manifest_path.parent.resolve())
+    return manifest
+
+
+def route_to_json(route_arg: str) -> tuple[list[tuple[int, str, int]], str]:
+    route = parse_route(route_arg)
+    if not route:
+        raise ValueError("route did not contain any shard entries")
+    route_json = json.dumps(
+        [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
+        separators=(",", ":"),
+    )
+    return route, route_json
+
+
+def tensor_to_float32_bytes(tensor: torch.Tensor) -> bytes:
+    array = tensor.detach().to(dtype=torch.float32).cpu().contiguous().numpy().astype("<f4", copy=False)
+    return array.tobytes(order="C")
+
+
+def float32_bytes_to_tensor(body: bytes, shape: list[int], device: str) -> torch.Tensor:
+    array = np.frombuffer(body, dtype="<f4").copy().reshape(shape)
+    return torch.from_numpy(array).to(device)
+
+
+def raise_for_worker_error(header: dict[str, Any], body: bytes) -> None:
+    if header.get("messageType") != "ERROR":
+        return
+    try:
+        detail = body.decode("utf-8")
+    except UnicodeDecodeError:
+        detail = repr(body)
+    raise RuntimeError(detail)
+
+
+def send_control(
+    sock: socket.socket,
+    route_json: str,
+    first_shard: int,
+    message_type: str,
+    request_id: str,
+    model_id: str,
+    checksum: str,
+) -> tuple[dict[str, Any], bytes, float]:
+    msg = TensorMessage(
+        message_type=message_type,
+        request_id=request_id,
+        step=0,
+        source_shard=0,
+        target_shard=first_shard,
+        shape=[0],
+        dtype="control",
+        bytes_data=bytes(),
+        response_mode="ack",
+        checksum=checksum,
+        route=route_json,
+        extra_headers={"modelId": model_id, "currentLength": 0, "architecture": "llama"},
+    )
+    started = time.perf_counter()
+    send_tensor(sock, msg)
+    header, body = recv_tensor(sock)
+    raise_for_worker_error(header, body)
+    return header, body, (time.perf_counter() - started) * 1000.0
+
+
+def tokenize_llama_prompt(
+    tokenizer,
+    prompt: str,
+    chat_template: bool,
+    system: str | None,
+    device: str,
+) -> torch.Tensor:
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    use_chat_template = chat_template and has_chat_template
+    if not use_chat_template:
+        return tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    ).to(device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Send a fake tensor or text route message to Android workers.")
+    parser.add_argument("--llama-service", action="store_true", help="Run persistent Llama coordinator service mode.")
+    parser.add_argument("--artifact-dir", default="artifacts/llama32_3b_sm8750_3way")
+    parser.add_argument("--model-id", default=None, help="Override manifest model_id for Llama coordinator mode.")
     parser.add_argument("--host", help="Android phone IP address shown in the worker app")
     parser.add_argument("--port", type=int, default=9000, help="Android worker port")
     parser.add_argument("--message", help="Send this UTF-8 text instead of a fake tensor, e.g. hello")
@@ -126,13 +231,26 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "float16"])
+    parser.add_argument("--llama-dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--repeat", type=int, default=1, help="Number of request/response trials")
     parser.add_argument("--delay-ms", type=float, default=0.0, help="Delay between repeated trials")
     parser.add_argument("--persistent", action="store_true", help="Reuse one TCP connection for repeated trials")
     parser.add_argument("--response-mode", default="echo", choices=["echo", "ack"], help="Android response body mode")
     parser.add_argument("--checksum", default="sha256", choices=["sha256", "none"], help="Checksum mode")
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--default-max-new-tokens", type=int, default=8)
+    parser.add_argument("--no-chat-template", action="store_false", dest="chat_template")
+    parser.add_argument("--system", default=None)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument("--listen-port", type=int, default=9300)
+    parser.set_defaults(chat_template=True)
     args = parser.parse_args()
+
+    if args.llama_service:
+        run_llama_service(args)
+        return
 
     if args.tokenize_message:
         run_token_route(args)
@@ -245,13 +363,13 @@ def run_one_iteration(
     try:
         response_header, response_body, elapsed_ms = run_trial(args, msg, persistent_sock)
     except TimeoutError:
-        print_connection_help(first_host, first_port, "connection timed out")
+        print_connection_help(args.host, args.port, "connection timed out")
         sys.exit(2)
     except OSError as error:
         reason = error.strerror or str(error)
         if error.errno == errno.ECONNREFUSED:
             reason = "connection refused"
-        print_connection_help(first_host, first_port, reason)
+        print_connection_help(args.host, args.port, reason)
         sys.exit(2)
 
     latencies_ms.append(elapsed_ms)
@@ -501,6 +619,291 @@ def execute_tensor_route(
         "trials": trials,
         "summary": summary,
     }
+
+
+class LlamaCoordinatorService:
+    def __init__(self, args: argparse.Namespace):
+        self.manifest = load_manifest(args.artifact_dir)
+        architecture = self.manifest.get("architecture") or self.manifest.get("shards", [{}])[0].get("architecture")
+        if architecture != "llama":
+            raise ValueError(f"expected a llama manifest, got architecture={architecture!r}")
+        if not args.route:
+            raise ValueError("--route is required for --llama-service")
+
+        self.route, self.route_json = route_to_json(args.route)
+        expected_devices = int(self.manifest["num_devices"])
+        if len(self.route) != expected_devices:
+            raise ValueError(f"manifest expects {expected_devices} shards, got route with {len(self.route)}")
+
+        self.model_id = args.model_id or self.manifest["model_id"]
+        self.timeout = args.timeout
+        self.checksum = args.checksum
+        self.device = args.device
+        self.dtype = args.llama_dtype
+        self.default_max_new_tokens = args.default_max_new_tokens
+        self.force_chat_template = args.chat_template
+        self.default_system = args.system
+        self.max_cache_len = int(self.manifest["max_cache_len"])
+        self.first_shard, self.first_host, self.first_port = self.route[0]
+
+        print(f"[mac-coordinator] loading tokenizer from {self.model_id}", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        print(f"[mac-coordinator] loading model from {self.model_id}", flush=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            dtype=parse_torch_dtype(self.dtype),
+        ).to(self.device)
+        self.model.eval()
+
+        print(
+            f"[mac-coordinator] connecting to shard_{self.first_shard} at {self.first_host}:{self.first_port}",
+            flush=True,
+        )
+        self.sock = socket.create_connection((self.first_host, self.first_port), timeout=self.timeout)
+        self.sock.settimeout(self.timeout)
+        configure_socket(self.sock)
+        print("[mac-coordinator] ready", flush=True)
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int | None = None,
+        system: str | None = None,
+        chat_template: bool | None = None,
+    ) -> dict[str, Any]:
+        if not prompt:
+            raise ValueError("prompt must be non-empty")
+        token_budget = self.default_max_new_tokens if max_new_tokens is None else int(max_new_tokens)
+        if token_budget <= 0:
+            raise ValueError("max_new_tokens must be positive")
+
+        prompt_ids = tokenize_llama_prompt(
+            self.tokenizer,
+            prompt,
+            self.force_chat_template if chat_template is None else bool(chat_template),
+            self.default_system if system is None else system,
+            self.device,
+        )
+        prompt_len = int(prompt_ids.shape[1])
+        if prompt_len + token_budget > self.max_cache_len:
+            raise ValueError(
+                f"prompt tokens ({prompt_len}) + max_new_tokens ({token_budget}) exceeds "
+                f"max_cache_len ({self.max_cache_len})"
+            )
+
+        request_prefix = f"mac-llama-{int(time.time() * 1000)}"
+        generated_ids: list[int] = prompt_ids[0].detach().cpu().tolist()
+        predicted_next: int | None = None
+        trials: list[dict[str, Any]] = []
+        latencies_ms: list[float] = []
+        eos_token_id = self.tokenizer.eos_token_id
+
+        print(
+            f"[mac-coordinator] start_request prompt_tokens={prompt_len} max_new_tokens={token_budget} "
+            f"mode=single_token_decode worker_kv_cache_expected=true",
+            flush=True,
+        )
+
+        start_header, _, start_ms = send_control(
+            sock=self.sock,
+            route_json=self.route_json,
+            first_shard=self.first_shard,
+            message_type="START_REQUEST",
+            request_id=f"{request_prefix}-start",
+            model_id=self.model_id,
+            checksum=self.checksum,
+        )
+
+        started_at = time.time()
+        try:
+            with torch.inference_mode():
+                for step in range(prompt_len + token_budget):
+                    if step < prompt_len:
+                        token = prompt_ids[:, step : step + 1]
+                        token_id = int(token.item())
+                        phase = "prefill"
+                    else:
+                        if predicted_next is None:
+                            raise RuntimeError("decode step reached before a predicted token was available")
+                        token_id = predicted_next
+                        token = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
+                        phase = "decode"
+
+                    print(
+                        f"[mac-coordinator] step={step} phase={phase} send_tokens=1 current_length={step + 1} "
+                        f"token_id={token_id}",
+                        flush=True,
+                    )
+
+                    hidden = self.model.model.embed_tokens(token)
+                    body = tensor_to_float32_bytes(hidden)
+                    msg = TensorMessage(
+                        message_type="STEP_HIDDEN",
+                        request_id=f"{request_prefix}-step-{step}",
+                        step=step,
+                        source_shard=0,
+                        target_shard=self.first_shard,
+                        shape=list(hidden.shape),
+                        dtype="float32",
+                        bytes_data=body,
+                        response_mode="echo",
+                        checksum=self.checksum,
+                        route=self.route_json,
+                        extra_headers={
+                            "modelId": self.model_id,
+                            "architecture": "llama",
+                            "currentLength": step + 1,
+                        },
+                    )
+
+                    step_started = time.perf_counter()
+                    send_tensor(self.sock, msg)
+                    header, response_body = recv_tensor(self.sock)
+                    raise_for_worker_error(header, response_body)
+                    elapsed_ms = (time.perf_counter() - step_started) * 1000.0
+                    latencies_ms.append(elapsed_ms)
+
+                    if header.get("dtype") != "float32":
+                        raise ValueError(f"expected float32 hidden state, got {header.get('dtype')}")
+                    output_shape = [int(value) for value in header.get("shape", [])]
+                    final_hidden = float32_bytes_to_tensor(response_body, output_shape, self.device)
+                    logits = self.model.lm_head(self.model.model.norm(final_hidden))
+                    predicted_next = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+                    kept = step >= prompt_len - 1
+                    print(
+                        f"[mac-coordinator] step={step} recv_hidden_shape={output_shape} "
+                        f"predicted_next={predicted_next} kept={kept}",
+                        flush=True,
+                    )
+                    if kept:
+                        generated_ids.append(predicted_next)
+                    trials.append(
+                        {
+                            "step": step,
+                            "phase": phase,
+                            "inputTokenId": token_id,
+                            "inputTokenText": self.tokenizer.decode([token_id], skip_special_tokens=False),
+                            "predictedTokenId": predicted_next,
+                            "predictedTokenText": self.tokenizer.decode([predicted_next], skip_special_tokens=False),
+                            "kept": kept,
+                            "requestBytes": len(body),
+                            "responseBytes": len(response_body),
+                            "latencyMs": elapsed_ms,
+                        }
+                    )
+                    if phase == "decode" and eos_token_id is not None and predicted_next == int(eos_token_id):
+                        break
+                    if len(generated_ids) >= prompt_len + token_budget:
+                        break
+        finally:
+            try:
+                flush_header, _, flush_ms = send_control(
+                    sock=self.sock,
+                    route_json=self.route_json,
+                    first_shard=self.first_shard,
+                    message_type="FLUSH_REQUEST",
+                    request_id=f"{request_prefix}-flush",
+                    model_id=self.model_id,
+                    checksum=self.checksum,
+                )
+            except Exception as exc:
+                print(f"[mac-coordinator] flush_request failed: {exc}", flush=True)
+                flush_header = {"error": str(exc)}
+                flush_ms = 0.0
+
+        output_text = self.tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        duration_ms = int((time.time() - started_at) * 1000)
+        return {
+            "ok": True,
+            "mode": "llama",
+            "modelId": self.model_id,
+            "prompt": prompt,
+            "promptTokenIds": prompt_ids[0].detach().cpu().tolist(),
+            "generatedTokenIds": generated_ids,
+            "promptTokenCount": prompt_len,
+            "generatedTokenCount": max(len(generated_ids) - prompt_len, 0),
+            "output": output_text,
+            "durationMs": duration_ms,
+            "route": ",".join(f"{sid}={host}:{port}" for sid, host, port in self.route),
+            "routeHops": [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in self.route],
+            "startHeader": start_header,
+            "flushHeader": flush_header,
+            "startMs": start_ms,
+            "flushMs": flush_ms,
+            "trials": trials,
+            "summary": {
+                "minMs": min(latencies_ms) if latencies_ms else 0.0,
+                "p50Ms": percentile(latencies_ms, 50) if latencies_ms else 0.0,
+                "p95Ms": percentile(latencies_ms, 95) if latencies_ms else 0.0,
+                "maxMs": max(latencies_ms) if latencies_ms else 0.0,
+            },
+        }
+
+
+class LlamaRequestHandler(BaseHTTPRequestHandler):
+    service: LlamaCoordinatorService
+
+    def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self._write_json(HTTPStatus.OK, {"status": "ok"})
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/generate":
+            self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(content_length)
+        try:
+            request = json.loads(payload.decode("utf-8"))
+            result = self.service.generate(
+                prompt=str(request.get("prompt", "")),
+                max_new_tokens=request.get("max_new_tokens"),
+                system=request.get("system"),
+                chat_template=request.get("chat_template"),
+            )
+            print(
+                f"[mac-coordinator] prompt_tokens={result['promptTokenCount']} "
+                f"generated_tokens={result['generatedTokenCount']} duration_ms={result['durationMs']}",
+                flush=True,
+            )
+            print(f"[mac-coordinator] output: {result['output']}", flush=True)
+            self._write_json(HTTPStatus.OK, result)
+        except Exception as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def run_llama_service(args: argparse.Namespace) -> None:
+    service = LlamaCoordinatorService(args)
+    if args.message:
+        result = service.generate(
+            prompt=args.message,
+            max_new_tokens=args.max_new_tokens,
+            system=args.system,
+            chat_template=args.chat_template,
+        )
+        print(json.dumps(result, indent=2))
+        return
+    LlamaRequestHandler.service = service
+    server = HTTPServer((args.listen_host, args.listen_port), LlamaRequestHandler)
+    print(f"[mac-coordinator] listening on http://{args.listen_host}:{args.listen_port}", flush=True)
+    server.serve_forever()
 
 
 def parse_route(route_arg: str) -> list[tuple[int, str, int]]:

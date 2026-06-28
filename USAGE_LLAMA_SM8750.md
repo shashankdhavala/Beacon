@@ -170,3 +170,63 @@ python scripts/export_shards.py \
   --qnn \
   --device cpu
 ```
+
+## 9. Run the persistent master + shard simulation
+
+Start shard workers in three terminals:
+
+```bash
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
+  --shard-index 2 \
+  --port 9102
+```
+
+```bash
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
+  --shard-index 1 \
+  --port 9101 \
+  --downstream-host 127.0.0.1 \
+  --downstream-port 9102
+```
+
+```bash
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
+  --shard-index 0 \
+  --port 9100 \
+  --downstream-host 127.0.0.1 \
+  --downstream-port 9101
+```
+
+Start the master once in a fourth terminal:
+
+```bash
+python scripts/run_master.py \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
+  --shard-port 9100 \
+  --listen-port 9200 \
+  --default-max-new-tokens 8 \
+  --dtype float32 \
+  --device cpu
+```
+
+Then send prompts to the already-running master:
+
+```bash
+curl -X POST http://127.0.0.1:9200/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Give me one short sentence about offline medical triage.","max_new_tokens":8}'
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:9200/health
+```
+
+Behavior:
+- the master loads tokenizer + model once at startup
+- the master keeps the shard_0 socket open across requests
+- each request still gets a fresh shard-local KV lifecycle via `start_request` / `flush_request`

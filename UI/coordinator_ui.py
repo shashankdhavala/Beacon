@@ -17,9 +17,10 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from android_llama_coordinator import execute_llama_route
 from mac_coordinator import execute_text_route, parse_route
 
 
@@ -502,7 +503,7 @@ HTML = r"""<!doctype html>
             <button class="sample" type="button" data-sample="Translate hello">Translate hello</button>
           </div>
           <button id="runButton" type="submit">Run Through Shards</button>
-          <div class="hint">Launch with <code>--mode llama</code> to run one-token hidden states through the on-device shard runtime.</div>
+          <div class="hint">Start <code>tools/mac_coordinator.py --llama-service</code> first, then send prompts from this UI.</div>
         </form>
       </section>
 
@@ -598,7 +599,7 @@ HTML = r"""<!doctype html>
         </div>
         <div class="tab-panel" data-panel="metrics">
           <div class="metrics">
-            <div class="metric"><div class="name">Tokens</div><div class="value">${isModelRoute ? data.generatedTokenIds.length : data.tokens.length}</div></div>
+            <div class="metric"><div class="name">Tokens</div><div class="value">${isModelRoute ? data.generatedTokenCount : data.tokens.length}</div></div>
             <div class="metric"><div class="name">p50</div><div class="value">${fmtMs(data.summary.p50Ms)}</div></div>
             <div class="metric"><div class="name">p95</div><div class="value">${fmtMs(data.summary.p95Ms)}</div></div>
             <div class="metric"><div class="name">Mode</div><div class="value">${isModelRoute ? data.mode.toUpperCase() : "TEXT"}</div></div>
@@ -678,11 +679,30 @@ class CoordinatorUiHandler(BaseHTTPRequestHandler):
     route: str = ""
     timeout: float = 10.0
     mode: str = "text"
-    artifact_dir: str = "artifacts/llama32_3b_sm8750_3way"
     max_new_tokens: int = 8
-    model_id: str | None = None
-    dtype: str = "float32"
-    chat_template: bool = False
+    coordinator_url: str = "http://127.0.0.1:9300/generate"
+
+    def call_llama_coordinator(self, prompt: str) -> dict[str, Any]:
+        payload = json.dumps(
+            {
+                "prompt": prompt,
+                "max_new_tokens": self.max_new_tokens,
+            }
+        ).encode("utf-8")
+        req = urllib_request.Request(
+            self.coordinator_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"coordinator HTTP {error.code}: {detail}") from error
+        except URLError as error:
+            raise RuntimeError(f"could not reach coordinator at {self.coordinator_url}: {error.reason}") from error
 
     def do_GET(self) -> None:
         if self.path not in ("/", "/index.html"):
@@ -705,17 +725,7 @@ class CoordinatorUiHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             message = str(payload.get("message", ""))
             if self.mode == "llama":
-                result = execute_llama_route(
-                    route_arg=self.route,
-                    prompt=message,
-                    artifact_dir=self.artifact_dir,
-                    model_id=self.model_id,
-                    max_new_tokens=self.max_new_tokens,
-                    checksum="none",
-                    timeout=self.timeout,
-                    dtype=self.dtype,
-                    chat_template=self.chat_template,
-                )
+                result = self.call_llama_coordinator(message)
             else:
                 result = execute_text_route(
                     route_arg=self.route,
@@ -746,27 +756,23 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--mode", choices=["text", "llama"], default="text")
-    parser.add_argument("--artifact-dir", default="artifacts/llama32_3b_sm8750_3way")
-    parser.add_argument("--model-id", default=None)
-    parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
-    parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--coordinator-url", default="http://127.0.0.1:9300/generate")
     args = parser.parse_args()
 
     parse_route(args.route)
     CoordinatorUiHandler.route = args.route
     CoordinatorUiHandler.timeout = args.timeout
     CoordinatorUiHandler.mode = args.mode
-    CoordinatorUiHandler.artifact_dir = args.artifact_dir
-    CoordinatorUiHandler.model_id = args.model_id
-    CoordinatorUiHandler.dtype = args.dtype
-    CoordinatorUiHandler.chat_template = args.chat_template
     CoordinatorUiHandler.max_new_tokens = args.max_new_tokens
+    CoordinatorUiHandler.coordinator_url = args.coordinator_url
 
     server = ThreadingHTTPServer((args.host, args.port), CoordinatorUiHandler)
     print(f"Beacon Coordinator UI running at http://{args.host}:{args.port}")
     print(f"Route: {args.route}")
     print(f"Mode: {args.mode}")
+    if args.mode == "llama":
+        print(f"Coordinator URL: {args.coordinator_url}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
