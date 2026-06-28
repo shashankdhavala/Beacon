@@ -79,6 +79,8 @@ class ActivationServer(
 
                         val response = if (request.messageType == "TEXT") {
                             handleTextRoute(request)
+                        } else if (request.messageType == "TENSOR" && request.route.isNotBlank()) {
+                            handleTensorRoute(request)
                         } else {
                             // MVP behavior: echo the exact tensor bytes back as a RESULT.
                             // Later this is where ExecuTorch shard B will run.
@@ -135,6 +137,37 @@ class ActivationServer(
 
         log("Forwarding text request=${request.requestId} to shard ${nextHop.shardId} at ${nextHop.host}:${nextHop.port}")
         return forwardOnce(nextHop.host, nextHop.port, appendedPayload)
+    }
+
+    private fun handleTensorRoute(request: TensorPayload): TensorPayload {
+        val route = parseRoute(request.route)
+        val currentIndex = route.indexOfFirst { it.shardId == shardId }
+        val nextHop = if (currentIndex >= 0) route.getOrNull(currentIndex + 1) else null
+
+        val forwardedPayload = request.copy(
+            messageType = "TENSOR",
+            step = request.step + 1,
+            sourceShard = shardId,
+            targetShard = nextHop?.shardId ?: 0,
+        )
+
+        if (route.isEmpty()) {
+            log("No route metadata for tensor; returning as terminal shard")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        if (currentIndex < 0) {
+            log("Shard $shardId not found in tensor route; returning as terminal shard")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        if (nextHop == null) {
+            log("Terminal tensor shard $shardId returning bytes=${request.bytes.size}")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        log("Forwarding tensor request=${request.requestId} bytes=${request.bytes.size} to shard ${nextHop.shardId} at ${nextHop.host}:${nextHop.port}")
+        return forwardOnce(nextHop.host, nextHop.port, forwardedPayload)
     }
 
     private fun parseRoute(routeJson: String): List<RouteHop> {

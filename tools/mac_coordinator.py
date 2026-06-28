@@ -116,6 +116,11 @@ def main() -> None:
         "--route",
         help='Shard route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"',
     )
+    parser.add_argument(
+        "--tensor-route",
+        action="store_true",
+        help="Send random tensor bytes through --route and verify byte-for-byte equality",
+    )
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "float16"])
@@ -131,8 +136,12 @@ def main() -> None:
         run_token_route(args)
         return
 
+    if args.tensor_route:
+        run_tensor_route(args)
+        return
+
     if not args.host:
-        raise SystemExit("--host is required unless --tokenize-message is used with --route")
+        raise SystemExit("--host is required unless --tokenize-message or --tensor-route is used with --route")
 
     shape = [1, args.seq_len, args.hidden_size]
     num_values = 1
@@ -256,18 +265,38 @@ def run_one_iteration(
 
 
 def run_token_route(args: argparse.Namespace) -> None:
-    if not args.message:
-        raise SystemExit("--tokenize-message requires --message")
-    if not args.route:
-        raise SystemExit('--tokenize-message requires --route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"')
+    try:
+        result = execute_text_route(
+            route_arg=args.route,
+            message=args.message,
+            checksum=args.checksum,
+            timeout=args.timeout,
+            delay_ms=args.delay_ms,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    print(result["output"])
 
-    tokens = args.message.split()
+
+def execute_text_route(
+    route_arg: str | None,
+    message: str | None,
+    checksum: str = "none",
+    timeout: float = 10.0,
+    delay_ms: float = 0.0,
+) -> dict[str, Any]:
+    if not message:
+        raise ValueError("message is required")
+    if not route_arg:
+        raise ValueError('text route requires a route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"')
+
+    tokens = message.split()
     if not tokens:
-        raise SystemExit("--message did not contain any whitespace-delimited tokens")
+        raise ValueError("message did not contain any whitespace-delimited tokens")
 
-    route = parse_route(args.route)
+    route = parse_route(route_arg)
     if not route:
-        raise SystemExit("--route did not contain any shard entries")
+        raise ValueError("route did not contain any shard entries")
     first_shard, first_host, first_port = route[0]
     route_json = json.dumps(
         [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
@@ -275,42 +304,201 @@ def run_token_route(args: argparse.Namespace) -> None:
     )
 
     received: list[str] = []
-    try:
-        with socket.create_connection((first_host, first_port), timeout=args.timeout) as sock:
-            sock.settimeout(args.timeout)
-            configure_socket(sock)
-            for step, token in enumerate(tokens):
-                body = token.encode("utf-8")
-                msg = TensorMessage(
-                    message_type="TEXT",
-                    request_id=f"mac-token-{int(time.time() * 1000)}-{step}",
-                    step=step,
-                    source_shard=0,
-                    target_shard=first_shard,
-                    shape=[len(body)],
-                    dtype="utf8",
-                    bytes_data=body,
-                    response_mode="echo",
-                    checksum=args.checksum,
-                    route=route_json,
-                )
-                send_tensor(sock, msg)
-                header, response_body = recv_tensor(sock)
-                if header.get("dtype") != "utf8":
-                    raise ValueError(f"expected utf8 response, got {header.get('dtype')}")
-                text = response_body.decode("utf-8")
-                received.append(text)
-    except TimeoutError:
-        print_connection_help(args.host, args.port, "connection timed out")
-        sys.exit(2)
-    except OSError as error:
-        reason = error.strerror or str(error)
-        if error.errno == errno.ECONNREFUSED:
-            reason = "connection refused"
-        print_connection_help(args.host, args.port, reason)
-        sys.exit(2)
+    trials: list[dict[str, Any]] = []
+    latencies_ms: list[float] = []
+    with socket.create_connection((first_host, first_port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        configure_socket(sock)
+        for step, token in enumerate(tokens):
+            body = token.encode("utf-8")
+            msg = TensorMessage(
+                message_type="TEXT",
+                request_id=f"mac-token-{int(time.time() * 1000)}-{step}",
+                step=step,
+                source_shard=0,
+                target_shard=first_shard,
+                shape=[len(body)],
+                dtype="utf8",
+                bytes_data=body,
+                response_mode="echo",
+                checksum=checksum,
+                route=route_json,
+            )
+            start = time.perf_counter()
+            send_tensor(sock, msg)
+            header, response_body = recv_tensor(sock)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if header.get("dtype") != "utf8":
+                raise ValueError(f"expected utf8 response, got {header.get('dtype')}")
+            text = response_body.decode("utf-8")
+            received.append(text)
+            latencies_ms.append(elapsed_ms)
+            trials.append(
+                {
+                    "step": step,
+                    "token": token,
+                    "received": text,
+                    "requestBytes": len(body),
+                    "responseBytes": len(response_body),
+                    "latencyMs": elapsed_ms,
+                    "requestId": msg.request_id,
+                    "responseHeader": header,
+                }
+            )
+            if step != len(tokens) - 1 and delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
 
-    print("".join(received))
+    return {
+        "ok": True,
+        "message": message,
+        "tokens": tokens,
+        "output": "".join(received),
+        "route": route_arg,
+        "routeHops": [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
+        "trials": trials,
+        "summary": {
+            "minMs": min(latencies_ms) if latencies_ms else 0.0,
+            "p50Ms": percentile(latencies_ms, 50) if latencies_ms else 0.0,
+            "p95Ms": percentile(latencies_ms, 95) if latencies_ms else 0.0,
+            "maxMs": max(latencies_ms) if latencies_ms else 0.0,
+        },
+    }
+
+
+def run_tensor_route(args: argparse.Namespace) -> None:
+    result = execute_tensor_route(
+        route_arg=args.route,
+        seq_len=args.seq_len,
+        hidden_size=args.hidden_size,
+        repeat=args.repeat,
+        dtype=args.dtype,
+        checksum=args.checksum,
+        timeout=args.timeout,
+        delay_ms=args.delay_ms,
+    )
+    for trial in result["trials"]:
+        print(
+            f"{trial['status']} step={trial['step']} shape={result['shape']} "
+            f"bytes={result['requestBytes']} returned={trial['returnedBytes']} "
+            f"expected_sha={trial['expectedSha12']} actual_sha={trial['actualSha12']} "
+            f"latency_ms={trial['latencyMs']:.2f}"
+        )
+    if len(result["trials"]) > 1:
+        print()
+        print("Summary:")
+        print(f"trials={len(result['trials'])}")
+        print(f"route={result['route']}")
+        print(f"shape={result['shape']} dtype={result['dtype']} bytes={result['requestBytes']}")
+        print(f"min_ms={result['summary']['minMs']:.2f}")
+        print(f"p50_ms={result['summary']['p50Ms']:.2f}")
+        print(f"p95_ms={result['summary']['p95Ms']:.2f}")
+        print(f"max_ms={result['summary']['maxMs']:.2f}")
+
+
+def execute_tensor_route(
+    route_arg: str | None,
+    seq_len: int,
+    hidden_size: int,
+    repeat: int,
+    dtype: str = "fp16",
+    checksum: str = "none",
+    timeout: float = 10.0,
+    delay_ms: float = 0.0,
+) -> dict[str, Any]:
+    if not route_arg:
+        raise ValueError('tensor route requires a route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"')
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    if hidden_size <= 0:
+        raise ValueError("hidden_size must be positive")
+    if repeat <= 0:
+        raise ValueError("repeat must be positive")
+
+    route = parse_route(route_arg)
+    if not route:
+        raise ValueError("route did not contain any shard entries")
+    first_shard, first_host, first_port = route[0]
+    route_json = json.dumps(
+        [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
+        separators=(",", ":"),
+    )
+
+    shape = [1, seq_len, hidden_size]
+    num_values = 1
+    for dim in shape:
+        num_values *= dim
+
+    trials: list[dict[str, Any]] = []
+    latencies_ms: list[float] = []
+    with socket.create_connection((first_host, first_port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        configure_socket(sock)
+        for trial in range(repeat):
+            tensor_bytes = fake_fp16_tensor_bytes(num_values)
+            expected_sha = sha256_hex(tensor_bytes)
+            msg = TensorMessage(
+                message_type="TENSOR",
+                request_id=f"mac-tensor-route-{int(time.time() * 1000)}-{trial}",
+                step=trial,
+                source_shard=0,
+                target_shard=first_shard,
+                shape=shape,
+                dtype=dtype,
+                bytes_data=tensor_bytes,
+                response_mode="echo",
+                checksum=checksum,
+                route=route_json,
+            )
+            start = time.perf_counter()
+            send_tensor(sock, msg)
+            header, response_body = recv_tensor(sock)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+            actual_sha = sha256_hex(response_body)
+            bytes_match = response_body == tensor_bytes
+            shape_match = header.get("shape") == shape
+            dtype_match = header.get("dtype") == dtype
+            status = "PASS" if bytes_match and shape_match and dtype_match else "FAIL"
+            latencies_ms.append(elapsed_ms)
+            trials.append(
+                {
+                    "status": status,
+                    "step": trial,
+                    "requestId": msg.request_id,
+                    "returnedBytes": len(response_body),
+                    "expectedSha": expected_sha,
+                    "actualSha": actual_sha,
+                    "expectedSha12": expected_sha[:12],
+                    "actualSha12": actual_sha[:12],
+                    "latencyMs": elapsed_ms,
+                    "bytesMatch": bytes_match,
+                    "shapeMatch": shape_match,
+                    "dtypeMatch": dtype_match,
+                    "responseHeader": header,
+                }
+            )
+            if status != "PASS":
+                break
+            if trial != repeat - 1 and delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+
+    summary = {
+        "minMs": min(latencies_ms) if latencies_ms else 0.0,
+        "p50Ms": percentile(latencies_ms, 50) if latencies_ms else 0.0,
+        "p95Ms": percentile(latencies_ms, 95) if latencies_ms else 0.0,
+        "maxMs": max(latencies_ms) if latencies_ms else 0.0,
+    }
+    return {
+        "ok": all(trial["status"] == "PASS" for trial in trials),
+        "route": route_arg,
+        "routeHops": [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
+        "shape": shape,
+        "dtype": dtype,
+        "requestBytes": num_values * 2,
+        "repeat": repeat,
+        "trials": trials,
+        "summary": summary,
+    }
 
 
 def parse_route(route_arg: str) -> list[tuple[int, str, int]]:
@@ -320,23 +508,23 @@ def parse_route(route_arg: str) -> list[tuple[int, str, int]]:
         if not entry:
             continue
         if "=" not in entry:
-            raise SystemExit(f"invalid route entry {entry!r}; expected shard=host:port")
+            raise ValueError(f"invalid route entry {entry!r}; expected shard=host:port")
         shard_text, address = entry.split("=", 1)
         try:
             shard_id = int(shard_text)
         except ValueError as error:
-            raise SystemExit(f"invalid shard id in route entry {entry!r}") from error
+            raise ValueError(f"invalid shard id in route entry {entry!r}") from error
         if ":" in address:
             host, port_text = address.rsplit(":", 1)
             try:
                 port = int(port_text)
             except ValueError as error:
-                raise SystemExit(f"invalid port in route entry {entry!r}") from error
+                raise ValueError(f"invalid port in route entry {entry!r}") from error
         else:
             host = address
             port = 9000
         if not host:
-            raise SystemExit(f"missing host in route entry {entry!r}")
+            raise ValueError(f"missing host in route entry {entry!r}")
         route.append((shard_id, host, port))
     return route
 
