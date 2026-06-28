@@ -68,6 +68,15 @@ class MasterNode:
     def detokenize(self, token_ids: Sequence[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
+    def embed_token(self, token_ids: torch.Tensor, step: int) -> torch.Tensor:
+        position_ids = torch.tensor([[step]], dtype=torch.long, device=self.device)
+        hidden_states = self.model.transformer.wte(token_ids) + self.model.transformer.wpe(position_ids)
+        return self.model.transformer.drop(hidden_states)
+
+    def project_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.model.transformer.ln_f(hidden_states)
+        return self.model.lm_head(hidden_states)
+
     def start_request(self) -> None:
         send_message(self.shard0_sock, {"type": "start_request"})
         receive_message(self.shard0_sock)
@@ -119,17 +128,19 @@ class MasterNode:
                     token = torch.argmax(last_logits[:, -1, :], dim=-1, keepdim=True)
                     generated = torch.cat([generated, token], dim=1)
 
+                hidden_states = self.embed_token(token, step)
                 send_message(
                     self.shard0_sock,
                     {
-                        "type": "step_token",
-                        "token_ids": token.cpu(),
+                        "type": "step_hidden",
+                        "hidden_states": hidden_states.cpu(),
                         "step": step,
                         "current_length": step + 1,
                     },
                 )
                 response = receive_message(self.shard0_sock)
-                last_logits = response["logits"].to(self.device)
+                last_hidden = response["hidden_states"].to(self.device)
+                last_logits = self.project_logits(last_hidden)
 
                 if step >= prompt_len - 1:
                     reference_outputs = self.model(

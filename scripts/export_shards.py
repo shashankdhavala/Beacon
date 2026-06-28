@@ -88,20 +88,12 @@ class GPT2DecodeOnlyShard(nn.Module):
         start_idx: int,
         end_idx: int,
         max_cache_len: int,
-        is_first: bool,
-        is_last: bool,
     ):
         super().__init__()
-        self.transformer = full_model.transformer
-        self.blocks = nn.ModuleList(self.transformer.h[start_idx:end_idx])
+        self.blocks = nn.ModuleList(full_model.transformer.h[start_idx:end_idx])
         self.layer_ids = [block.attn.layer_idx for block in self.blocks]
         self.max_cache_len = max_cache_len
-        self.is_first = is_first
-        self.is_last = is_last
         self.has_blocks = len(self.blocks) > 0
-        if self.is_last:
-            self.ln_f = self.transformer.ln_f
-            self.lm_head = full_model.lm_head
 
     def _allocate_cache(
         self,
@@ -129,12 +121,7 @@ class GPT2DecodeOnlyShard(nn.Module):
         return tuple(flat)
 
     def forward(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        if self.is_first:
-            input_ids, attention_mask, position_ids, cache_position, *past_kv = args
-            hidden_states = self.transformer.wte(input_ids) + self.transformer.wpe(position_ids)
-            hidden_states = self.transformer.drop(hidden_states)
-        else:
-            hidden_states, attention_mask, cache_position, *past_kv = args
+        hidden_states, attention_mask, cache_position, *past_kv = args
 
         if self.has_blocks:
             if len(past_kv) == 0:
@@ -163,11 +150,7 @@ class GPT2DecodeOnlyShard(nn.Module):
         else:
             cache_outputs = ()
 
-        if self.is_last:
-            hidden_states = self.ln_f(hidden_states)
-            output = self.lm_head(hidden_states).contiguous()
-        else:
-            output = hidden_states.contiguous()
+        output = hidden_states.contiguous()
         return (output, *cache_outputs)
 
 
@@ -186,8 +169,6 @@ class ShardManifest:
     num_heads: int
     head_dim: int
     cache_dtype: str
-    is_first: bool
-    is_last: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,10 +204,8 @@ def build_shard_modules(
             start,
             end,
             max_cache_len,
-            is_first=(idx == 0),
-            is_last=(idx == len(layer_ranges) - 1),
         ).eval()
-        for idx, (start, end) in enumerate(layer_ranges)
+        for start, end in layer_ranges
     ]
 
 
@@ -241,13 +220,15 @@ def build_export_examples(
     modules = build_shard_modules(model, layer_ranges, max_cache_len)
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     first_token = input_ids[:, :1]
-    attention_mask = make_fixed_attention_mask(1, max_cache_len, device)
     position_ids = torch.tensor([[0]], dtype=torch.long, device=device)
+    hidden_states = model.transformer.wte(first_token) + model.transformer.wpe(position_ids)
+    hidden_states = model.transformer.drop(hidden_states)
+    attention_mask = make_fixed_attention_mask(1, max_cache_len, device)
     cache_position = torch.tensor([0], dtype=torch.long, device=device)
 
     args_list: List[tuple[torch.Tensor, ...]] = []
-    current = first_token
-    for idx, module in enumerate(modules):
+    current = hidden_states
+    for module in modules:
         if module.has_blocks:
             num_heads = module.blocks[0].attn.num_heads
             head_dim = module.blocks[0].attn.head_dim
@@ -263,11 +244,7 @@ def build_export_examples(
         else:
             cache_args = ()
 
-        shard_args = (
-            (current, attention_mask, position_ids, cache_position, *cache_args)
-            if idx == 0
-            else (current, attention_mask, cache_position, *cache_args)
-        )
+        shard_args = (current, attention_mask, cache_position, *cache_args)
         args_list.append(shard_args)
         current = module(*shard_args)[0]
     return modules, args_list
@@ -299,6 +276,7 @@ def write_manifest(
     model_id: str,
     num_devices: int,
     max_cache_len: int,
+    model_dtype: torch.dtype,
     layer_ranges: Sequence[Tuple[int, int]],
     modules: Sequence[GPT2DecodeOnlyShard],
     artifact_paths: Sequence[ShardArtifactPath],
@@ -311,6 +289,11 @@ def write_manifest(
         else:
             num_heads = 0
             head_dim = 0
+        cache_dtype = (
+            str(next(module.parameters()).dtype).replace("torch.", "")
+            if any(True for _ in module.parameters())
+            else str(model_dtype).replace("torch.", "")
+        )
         shards.append(
             ShardManifest(
                 shard_index=idx,
@@ -320,9 +303,7 @@ def write_manifest(
                 num_layers=layer_range[1] - layer_range[0],
                 num_heads=num_heads,
                 head_dim=head_dim,
-                cache_dtype=str(next(module.parameters()).dtype).replace("torch.", ""),
-                is_first=module.is_first,
-                is_last=module.is_last,
+                cache_dtype=cache_dtype,
             ).__dict__
         )
 
@@ -371,6 +352,7 @@ def main() -> None:
         model_id=args.model_id,
         num_devices=args.num_devices,
         max_cache_len=args.max_cache_len,
+        model_dtype=model.dtype,
         layer_ranges=layer_ranges,
         modules=modules,
         artifact_paths=artifact_paths,

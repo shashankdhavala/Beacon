@@ -69,8 +69,8 @@ class ShardWorker:
         shard_info = manifest["shards"][shard_index]
         self.shard_index = shard_index
         self.max_cache_len = int(manifest["max_cache_len"])
-        self.is_first = bool(shard_info["is_first"])
-        self.is_last = bool(shard_info["is_last"])
+        self.num_devices = int(manifest["num_devices"])
+        self.is_last = shard_index == self.num_devices - 1
         self.num_layers = int(shard_info["num_layers"])
         self.num_heads = int(shard_info["num_heads"])
         self.head_dim = int(shard_info["head_dim"])
@@ -152,34 +152,6 @@ class ShardWorker:
             raise RuntimeError(f"shard_{self.shard_index} has no active request")
         return self.kv_cache
 
-    def handle_step_token(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.is_first:
-            raise RuntimeError("step_token sent to non-first shard")
-        token_ids = message["token_ids"].to(self.device)
-        step = int(message["step"])
-        current_length = int(message["current_length"])
-        self.log(
-            f"step_token: step={step} current_length={current_length} token_shape={tuple(token_ids.shape)}"
-        )
-        attention_mask = make_fixed_attention_mask(current_length, self.max_cache_len, self.device)
-        position_ids = torch.tensor([[step]], dtype=torch.long, device=self.device)
-        cache_position = torch.tensor([step], dtype=torch.long, device=self.device)
-        cache = self.require_cache()
-        outputs = self.shard.forward((token_ids, attention_mask, position_ids, cache_position, *cache))
-        self.kv_cache = tuple(t.to(self.device) for t in outputs[1:])
-        hidden_states = outputs[0].to(self.device)
-        self.log(f"forwarded hidden_states to downstream: shape={tuple(hidden_states.shape)}")
-        send_message(
-            self.downstream_sock,
-            {
-                "type": "step_hidden",
-                "hidden_states": hidden_states.cpu(),
-                "step": step,
-                "current_length": current_length,
-            },
-        )
-        return receive_message(self.downstream_sock)
-
     def handle_step_hidden(self, message: Dict[str, Any]) -> Dict[str, Any]:
         hidden_states = message["hidden_states"].to(self.device)
         step = int(message["step"])
@@ -194,8 +166,8 @@ class ShardWorker:
         self.kv_cache = tuple(t.to(self.device) for t in outputs[1:])
         current = outputs[0].to(self.device)
         if self.is_last:
-            self.log(f"produced logits for master: shape={tuple(current.shape)}")
-            return {"type": "step_result", "logits": current.cpu()}
+            self.log(f"produced hidden_states for master: shape={tuple(current.shape)}")
+            return {"type": "step_result", "hidden_states": current.cpu()}
 
         self.log(f"forwarded hidden_states to downstream: shape={tuple(current.shape)}")
         send_message(
@@ -217,8 +189,6 @@ class ShardWorker:
         if message_type == "flush_request":
             self.flush_request()
             return {"type": "ack"}
-        if message_type == "step_token":
-            return self.handle_step_token(message)
         if message_type == "step_hidden":
             return self.handle_step_hidden(message)
         raise ValueError(f"Unknown message type: {message_type}")
