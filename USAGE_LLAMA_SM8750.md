@@ -40,26 +40,41 @@ huggingface-cli download meta-llama/Llama-3.2-3B \
 
 Notes:
 - The download step fetches the model files from Hugging Face.
-- The fp16 choice is applied during export with `--dtype float16`.
-- You do not need a separate “fp16 download” command for this workflow.
+- For QNN HTP export, use `--pt2e-quantize qnn_16a4w` with `--dtype float32` (not `--dtype float16`).
+- fp16 lowering causes QNN dtype mismatches (float32 activations vs float16 weights) and is not HTP-native.
 
 ## 5. Export 3 Qualcomm shard artifacts for SM8750
 
-Run:
+Recommended (16-bit activations, 4-bit weights — fits on-device NPU):
 
 ```bash
 python scripts/export_shards.py \
   --model-id models/meta-llama/Llama-3.2-3B \
-  --artifact-dir artifacts/llama32_3b_sm8750 \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
   --num-devices 3 \
   --max-cache-len 32 \
-  --dtype float16 \
+  --dtype float32 \
+  --pt2e-quantize qnn_16a4w \
+  --qnn \
+  --device cpu
+```
+
+Fallback (fp32, no quantization — compiles but shards are ~3× larger):
+
+```bash
+python scripts/export_shards.py \
+  --model-id models/meta-llama/Llama-3.2-3B \
+  --artifact-dir artifacts/llama32_3b_sm8750_3way \
+  --num-devices 3 \
+  --max-cache-len 32 \
+  --dtype float32 \
   --qnn \
   --device cpu
 ```
 
 What this does:
-- loads the local Llama 3.2 3B checkpoint
+- loads the local Llama 3.2 3B checkpoint in float32
+- applies PT2E `qnn_16a4w` quantization per shard (HTP-native int kernels)
 - splits transformer layers across 3 shards
 - exports each shard as a Qualcomm QNN-backed ExecuTorch `.pte`
 - writes a `manifest.json` describing the shard layout
@@ -92,6 +107,7 @@ You should verify:
 - `model_id` points to `models/meta-llama/Llama-3.2-3B`
 - `num_devices` is `3`
 - `export_backend` is `qnn:SM8750`
+- `pt2e_quantize` is `qnn_16a4w` (when using the recommended command)
 - there are 3 shard entries
 
 ## 7. Common failure modes
@@ -139,7 +155,8 @@ python scripts/export_shards.py \
   --artifact-dir artifacts/llama32_3b_sm8750_3way \
   --num-devices 3 \
   --max-cache-len 32 \
-  --dtype float16 \
+  --dtype float32 \
+  --pt2e-quantize qnn_16a4w \
   --qnn \
   --device cpu
 ```

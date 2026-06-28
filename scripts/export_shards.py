@@ -25,11 +25,16 @@ try:
         generate_qnn_executorch_compiler_spec,
         to_edge_transform_and_lower_to_qnn,
     )
+    from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 except ImportError:
     QcomChipset = None
     generate_htp_compiler_spec = None
     generate_qnn_executorch_compiler_spec = None
     to_edge_transform_and_lower_to_qnn = None
+    convert_pt2e = None
+    prepare_pt2e = None
+
+QNN_PT2E_QUANT_CHOICES = ("qnn_16a4w", "qnn_8a8w", "qnn_16a16w")
 
 
 def prepare_attention_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -297,6 +302,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Export Qualcomm QNN-backed ExecuTorch artifacts for SM8750",
     )
+    parser.add_argument(
+        "--pt2e-quantize",
+        choices=list(QNN_PT2E_QUANT_CHOICES),
+        default=None,
+        help=(
+            "PT2E quantization recipe for QNN HTP (recommended: qnn_16a4w). "
+            "Requires --qnn and --dtype float32."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args()
 
@@ -398,15 +412,89 @@ def export_to_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
     return str(output_path)
 
 
-def export_to_qnn_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
+def get_qnn_pt2e_quantizer(pt2e_quantize: str):
+    try:
+        from executorch.extension.llm.export.quantizer_lib import get_qnn_quantizer
+    except ImportError:
+        from executorch.backends.qualcomm.quantizer.custom_annotation import (
+            custom_annotate_llama_matmul_16a8w,
+        )
+        from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
+        from torchao.quantization.pt2e import MinMaxObserver
+
+        backend, quant_config = pt2e_quantize.split("_")
+        if backend != "qnn":
+            raise ValueError(f"Expected qnn_* quant recipe, got {pt2e_quantize}")
+        qnn_quantizer = QnnQuantizer()
+        custom_annotations = ()
+        if quant_config == "8a8w":
+            quant_dtype = QuantDtype.use_8a8w
+            qnn_quantizer.set_default_quant_config(
+                quant_dtype,
+                is_qat=False,
+                is_conv_per_channel=True,
+                is_linear_per_channel=True,
+            )
+        elif quant_config == "16a16w":
+            quant_dtype = QuantDtype.use_16a16w
+            qnn_quantizer.set_default_quant_config(
+                quant_dtype,
+                is_qat=False,
+                is_conv_per_channel=False,
+                is_linear_per_channel=False,
+                act_observer=MinMaxObserver,
+            )
+        elif quant_config == "16a4w":
+            quant_dtype = QuantDtype.use_16a4w
+            qnn_quantizer.set_default_quant_config(
+                quant_dtype,
+                is_qat=False,
+                is_conv_per_channel=True,
+                is_linear_per_channel=True,
+                act_observer=MinMaxObserver,
+            )
+            custom_annotations = (custom_annotate_llama_matmul_16a8w,)
+        else:
+            raise ValueError(f"Unsupported QNN quant recipe: {pt2e_quantize}")
+        qnn_quantizer.add_custom_quant_annotations(custom_annotations)
+        return qnn_quantizer, quant_dtype
+
+    quantizer, quant_dtype = get_qnn_quantizer(pt2e_quantize)
+    return quantizer, quant_dtype
+
+
+def quantize_module_for_qnn(module: nn.Module, args: tuple, pt2e_quantize: str) -> nn.Module:
+    if prepare_pt2e is None or convert_pt2e is None:
+        raise ImportError(
+            "PT2E quantization requires torchao. Install Qualcomm ExecuTorch backend dependencies."
+        )
+    quantizer, _ = get_qnn_pt2e_quantizer(pt2e_quantize)
+    exported = torch.export.export(module.eval(), args, strict=False)
+    prepared = prepare_pt2e(exported.module(), quantizer)
+    prepared(*args)
+    return convert_pt2e(prepared)
+
+
+def export_to_qnn_pte(
+    module: nn.Module,
+    args: tuple,
+    output_path: Path,
+    pt2e_quantize: str | None = None,
+    use_fp16: bool = False,
+) -> str:
     ensure_qualcomm_export_available()
 
-    backend_options = generate_htp_compiler_spec(use_fp16=True)
+    export_module = module.eval()
+    if pt2e_quantize is not None:
+        print(f"Quantizing shard with PT2E recipe: {pt2e_quantize}")
+        export_module = quantize_module_for_qnn(export_module, args, pt2e_quantize)
+
+    backend_options = generate_htp_compiler_spec(use_fp16=use_fp16)
     compile_spec = generate_qnn_executorch_compiler_spec(
         soc_model=QcomChipset.SM8750,
         backend_options=backend_options,
     )
-    program = to_edge_transform_and_lower_to_qnn(module.eval(), args, compile_spec).to_executorch()
+    program = to_edge_transform_and_lower_to_qnn(export_module, args, compile_spec).to_executorch()
     with open(output_path, "wb") as fp:
         fp.write(program.buffer)
     return str(output_path)
@@ -417,13 +505,22 @@ def export_artifacts(
     args_list: Sequence[tuple[torch.Tensor, ...]],
     artifact_dir: Path,
     use_qnn: bool,
+    pt2e_quantize: str | None = None,
+    use_fp16: bool = False,
 ) -> List[ShardArtifactPath]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     paths: List[ShardArtifactPath] = []
     for idx, (module, args) in enumerate(zip(modules, args_list)):
         output_path = (artifact_dir / f"shard_{idx}.pte").resolve()
         if use_qnn:
-            path = export_to_qnn_pte(module, args, output_path)
+            print(f"Exporting QNN shard {idx}...")
+            path = export_to_qnn_pte(
+                module,
+                args,
+                output_path,
+                pt2e_quantize=pt2e_quantize,
+                use_fp16=use_fp16,
+            )
         else:
             path = export_to_pte(module, args, output_path)
         paths.append(ShardArtifactPath(path=path))
@@ -441,6 +538,7 @@ def write_manifest(
     layer_ranges: Sequence[Tuple[int, int]],
     modules: Sequence[nn.Module],
     artifact_paths: Sequence[ShardArtifactPath],
+    pt2e_quantize: str | None = None,
 ) -> Path:
     shards: List[dict] = []
     for idx, (layer_range, module, artifact_path) in enumerate(zip(layer_ranges, modules, artifact_paths)):
@@ -481,6 +579,7 @@ def write_manifest(
         "max_cache_len": max_cache_len,
         "export_backend": export_backend,
         "qualcomm_chipset": "SM8750" if export_backend == "qnn:SM8750" else None,
+        "pt2e_quantize": pt2e_quantize,
         "layer_ranges": [list(r) for r in layer_ranges],
         "shards": shards,
     }
@@ -496,14 +595,27 @@ def main() -> None:
     if args.qnn:
         ensure_qualcomm_export_available()
 
+    if args.pt2e_quantize and not args.qnn:
+        raise ValueError("--pt2e-quantize requires --qnn")
+    if args.pt2e_quantize and args.dtype != "float32":
+        raise ValueError(
+            f"--pt2e-quantize {args.pt2e_quantize} requires --dtype float32 "
+            "(quantization replaces fp16 lowering)"
+        )
+    if args.qnn and not args.pt2e_quantize and args.dtype == "float16":
+        print(
+            "WARNING: --qnn with --dtype float16 often causes QNN dtype mismatches "
+            "(float32 activations vs float16 weights). Prefer --pt2e-quantize qnn_16a4w "
+            "with --dtype float32, or use --dtype float32 without quantization."
+        )
+
     model = load_model(args.model_id, args.device, args.dtype)
     architecture = "gpt2" if is_gpt2_model(model) else "llama"
     num_layers = get_num_layers(model)
     if args.num_devices < 2:
         raise ValueError("num_devices must be at least 2")
-    if args.qnn and args.dtype != "float16":
-        raise ValueError("--qnn currently requires --dtype float16")
 
+    use_fp16 = args.qnn and args.pt2e_quantize is None and args.dtype == "float16"
     layer_ranges = compute_layer_ranges(num_layers, args.num_devices)
     modules, args_list = build_export_examples(
         model=model,
@@ -517,6 +629,8 @@ def main() -> None:
         args_list,
         Path(args.artifact_dir),
         args.qnn,
+        pt2e_quantize=args.pt2e_quantize,
+        use_fp16=use_fp16,
     )
     manifest_path = write_manifest(
         artifact_dir=Path(args.artifact_dir),
@@ -529,6 +643,7 @@ def main() -> None:
         layer_ranges=layer_ranges,
         modules=modules,
         artifact_paths=artifact_paths,
+        pt2e_quantize=args.pt2e_quantize,
     )
 
     print(f"Model: {args.model_id}")
@@ -537,6 +652,8 @@ def main() -> None:
     print(f"Layer ranges: {layer_ranges}")
     print(f"Max cache len: {args.max_cache_len}")
     print(f"Export backend: {export_backend}")
+    if args.pt2e_quantize:
+        print(f"PT2E quantization: {args.pt2e_quantize}")
     print("Artifacts:")
     for artifact in artifact_paths:
         print(f"  {artifact.path}")
