@@ -1,0 +1,63 @@
+{
+  "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+  "architecture": "llama",
+  "artifact_dir": "/data/local/tmp/beacon_et",
+  "num_devices": 3,
+  "hidden_size": 3072,
+  "max_cache_len": 32,
+  "export_backend": "qnn:SM8750",
+  "qualcomm_chipset": "SM8750",
+  "pt2e_quantize": "qnn_16a4w",
+  "layer_ranges": [
+    [
+      0,
+      10
+    ],
+    [
+      10,
+      19
+    ],
+    [
+      19,
+      28
+    ]
+  ],
+  "shards": [
+    {
+      "shard_index": 0,
+      "artifact_path": "shard_0.pte",
+      "architecture": "llama",
+      "export_backend": "qnn:SM8750",
+      "start_layer": 0,
+      "end_layer": 10,
+      "num_layers": 10,
+      "num_heads": 8,
+      "head_dim": 128,
+      "cache_dtype": "float32"
+    },
+    {
+      "shard_index": 1,
+      "artifact_path": "shard_1.pte",
+      "architecture": "llama",
+      "export_backend": "qnn:SM8750",
+      "start_layer": 10,
+      "end_layer": 19,
+      "num_layers": 9,
+      "num_heads": 8,
+      "head_dim": 128,
+      "cache_dtype": "float32"
+    },
+    {
+      "shard_index": 2,
+      "artifact_path": "shard_2.pte",
+      "architecture": "llama",
+      "export_backend": "qnn:SM8750",
+      "start_layer": 19,
+      "end_layer": 28,
+      "num_layers": 9,
+      "num_heads": 8,
+      "head_dim": 128,
+      "cache_dtype": "float32"
+    }
+  ]
+}

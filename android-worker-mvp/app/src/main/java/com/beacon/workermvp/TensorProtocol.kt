@@ -18,6 +18,8 @@ data class TensorPayload(
     val responseMode: String = "echo",
     val includeChecksum: Boolean = true,
     val route: String = "",
+    val currentLength: Int = 0,
+    val modelId: String = "",
 ) {
     fun toHeaderJson(): JSONObject {
         return JSONObject()
@@ -32,6 +34,8 @@ data class TensorPayload(
             .put("sha256", if (includeChecksum) sha256Hex(bytes) else "")
             .put("responseMode", responseMode)
             .put("route", route)
+            .put("currentLength", currentLength)
+            .put("modelId", modelId)
             .put("createdAtMs", System.currentTimeMillis())
     }
 
@@ -39,7 +43,8 @@ data class TensorPayload(
         val checksum = if (includeChecksum) sha256Hex(bytes).take(12) else "disabled"
         return "type=$messageType request=$requestId step=$step " +
             "source=$sourceShard target=$targetShard shape=${shape.contentToString()} " +
-            "dtype=$dtype bytes=${bytes.size} sha256=$checksum responseMode=$responseMode routeBytes=${route.length}"
+            "dtype=$dtype bytes=${bytes.size} sha256=$checksum responseMode=$responseMode " +
+            "currentLength=$currentLength routeBytes=${route.length}"
     }
 }
 
@@ -78,6 +83,8 @@ object TensorProtocol {
             responseMode = header.optString("responseMode", "echo"),
             includeChecksum = expectedSha.isNotEmpty(),
             route = header.optString("route", ""),
+            currentLength = header.optInt("currentLength", 0),
+            modelId = header.optString("modelId", ""),
         )
     }
 
