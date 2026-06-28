@@ -1,0 +1,52 @@
+{
+  "model_id": "sshleifer/tiny-gpt2",
+  "artifact_dir": "/Users/vishalkhot/Developer/Beacon/artifacts/tiny-gpt2",
+  "num_devices": 3,
+  "max_cache_len": 16,
+  "layer_ranges": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      2,
+      2
+    ]
+  ],
+  "shards": [
+    {
+      "shard_index": 0,
+      "artifact_path": "/Users/vishalkhot/Developer/Beacon/artifacts/tiny-gpt2/shard_0.pte",
+      "start_layer": 0,
+      "end_layer": 1,
+      "num_layers": 1,
+      "num_heads": 2,
+      "head_dim": 1,
+      "cache_dtype": "float32"
+    },
+    {
+      "shard_index": 1,
+      "artifact_path": "/Users/vishalkhot/Developer/Beacon/artifacts/tiny-gpt2/shard_1.pte",
+      "start_layer": 1,
+      "end_layer": 2,
+      "num_layers": 1,
+      "num_heads": 2,
+      "head_dim": 1,
+      "cache_dtype": "float32"
+    },
+    {
+      "shard_index": 2,
+      "artifact_path": "/Users/vishalkhot/Developer/Beacon/artifacts/tiny-gpt2/shard_2.pte",
+      "start_layer": 2,
+      "end_layer": 2,
+      "num_layers": 0,
+      "num_heads": 0,
+      "head_dim": 0,
+      "cache_dtype": "float32"
+    }
+  ]
+}

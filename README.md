@@ -278,3 +278,80 @@ Each engineer works on their branch and merges to `main` at integration checkpoi
 ## License
 
 Hackathon project — Qualcomm × Meta ExecuTorch Hackathon 2026.
+
+---
+
+## Local Sharding Flow
+
+The repo now keeps a single local path for GPT-2 sharded ExecuTorch testing.
+
+Files:
+- `scripts/export_shards.py`
+- `scripts/run_shard_worker.py`
+- `scripts/run_master.py`
+
+What `scripts/export_shards.py` does:
+- loads a GPT-2 style causal LM
+- splits transformer layers evenly across `num_devices`
+- exports one decode-style `.pte` artifact per shard
+- writes `manifest.json` with shard metadata for the worker processes
+- writes:
+  - `shard_0.pte`
+  - `shard_1.pte`
+  - `shard_2.pte`
+
+What `scripts/run_shard_worker.py` does:
+- runs one shard as its own TCP worker process
+- keeps KV cache local to that worker process for one active request
+- forwards activations to the next shard worker
+
+What `scripts/run_master.py` does:
+- tokenizes the prompt
+- connects only to shard 0
+- teacher-forces prompt tokens through the worker chain
+- appends generated tokens autoregressively after the prompt
+- checks greedy generation parity against the unsplit model
+
+Run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python scripts/export_shards.py \
+  --model-id gpt2 \
+  --num-devices 3 \
+  --max-cache-len 32 \
+  --max-new-tokens 4
+
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/gpt2 \
+  --shard-index 2 \
+  --port 9102
+
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/gpt2 \
+  --shard-index 1 \
+  --port 9101 \
+  --downstream-host 127.0.0.1 \
+  --downstream-port 9102
+
+python scripts/run_shard_worker.py \
+  --artifact-dir artifacts/gpt2 \
+  --shard-index 0 \
+  --port 9100 \
+  --downstream-host 127.0.0.1 \
+  --downstream-port 9101
+
+python scripts/run_master.py \
+  --artifact-dir artifacts/gpt2 \
+  --port 9100 \
+  --max-new-tokens 4
+```
+
+Current scope:
+- GPT-2 only
+- local Python TCP only
+- ExecuTorch `.pte` artifacts only
+- intended as the parity harness before wiring real cross-device transport

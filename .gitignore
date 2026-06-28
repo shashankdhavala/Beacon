@@ -11,10 +11,11 @@ captures/
 .cxx/
 
 # ExecuTorch / model artifacts
-*.pte
+*.pt2
 *.bin
 *.safetensors
 *.gguf
+models/
 
 # Python
 __pycache__/
@@ -35,3 +36,4 @@ venv/
 *.log
 benchmark_results/
 classmesh*
+
