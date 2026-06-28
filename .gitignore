@@ -35,3 +35,5 @@ venv/
 # Logs and benchmarks
 *.log
 benchmark_results/
+classmesh*
+
