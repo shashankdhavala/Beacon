@@ -147,10 +147,10 @@ class MainActivity : Activity() {
 
     private fun localIpv4Addresses(): List<AddressInfo> {
         val result = mutableListOf<AddressInfo>()
-        val interfaces = NetworkInterface.getNetworkInterfaces().toList()
+        val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return emptyList()
         for (networkInterface in interfaces) {
             if (!networkInterface.isUp || networkInterface.isLoopback) continue
-            val addresses = networkInterface.inetAddresses.toList()
+            val addresses = networkInterface.inetAddresses?.toList() ?: continue
             for (address in addresses) {
                 if (address is Inet4Address && !address.isLoopbackAddress) {
                     result += AddressInfo(networkInterface.name, address.hostAddress ?: continue)

@@ -17,7 +17,7 @@ class ActivationServer(
     private val log: (String) -> Unit,
 ) {
     private val running = AtomicBoolean(false)
-    private var serverSocket: ServerSocket? = null
+    @Volatile private var serverSocket: ServerSocket? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
