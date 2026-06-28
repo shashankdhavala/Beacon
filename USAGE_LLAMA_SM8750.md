@@ -74,10 +74,20 @@ python scripts/export_shards.py \
 
 What this does:
 - loads the local Llama 3.2 3B checkpoint in float32
-- applies PT2E `qnn_16a4w` quantization per shard (HTP-native int kernels)
+- builds realistic calibration activations by running representative tokens through the fp32 shard pipeline
+- applies PT2E `qnn_16a4w` quantization per shard (HTP-native int kernels), calibrating observers on those activations
 - splits transformer layers across 3 shards
 - exports each shard as a Qualcomm QNN-backed ExecuTorch `.pte`
 - writes a `manifest.json` describing the shard layout
+
+Calibration controls (optional):
+- `--calib-sequences N` — number of calibration token sequences (default 4)
+- `--calib-seq-len T` — tokens per sequence, capped at `--max-cache-len` (default 16)
+
+Calibration matters: PT2E observers must see real activation ranges. Calibrating on
+all-zero tensors produces degenerate (near-zero) quantization scales and broken output.
+Raise `--calib-sequences` / `--calib-seq-len` for better scale estimates at the cost of
+longer export time.
 
 Expected outputs:
 

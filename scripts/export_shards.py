@@ -311,6 +311,18 @@ def parse_args() -> argparse.Namespace:
             "Requires --qnn and --dtype float32."
         ),
     )
+    parser.add_argument(
+        "--calib-sequences",
+        type=int,
+        default=4,
+        help="Number of calibration token sequences for PT2E quantization observers.",
+    )
+    parser.add_argument(
+        "--calib-seq-len",
+        type=int,
+        default=16,
+        help="Tokens per calibration sequence (capped at --max-cache-len).",
+    )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args()
 
@@ -404,6 +416,87 @@ def build_export_examples(
     return modules, args_list
 
 
+def get_token_embeddings(model, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    if is_gpt2_model(model):
+        token_embeds = model.transformer.wte(input_ids)
+        position_embeds = model.transformer.wpe(position_ids)
+        return token_embeds + position_embeds
+    return model.model.embed_tokens(input_ids)
+
+
+def allocate_shard_cache_args(
+    model,
+    module: nn.Module,
+    max_cache_len: int,
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, ...]:
+    if not module.has_blocks:
+        return ()
+    if is_gpt2_model(model):
+        num_heads = module.blocks[0].attn.num_heads
+        head_dim = module.blocks[0].attn.head_dim
+    else:
+        num_heads = module.blocks[0].self_attn.config.num_key_value_heads
+        head_dim = module.blocks[0].self_attn.head_dim
+    keys = [
+        torch.zeros(1, num_heads, max_cache_len, head_dim, device=device, dtype=dtype)
+        for _ in range(len(module.blocks))
+    ]
+    values = [
+        torch.zeros(1, num_heads, max_cache_len, head_dim, device=device, dtype=dtype)
+        for _ in range(len(module.blocks))
+    ]
+    return tuple(t for pair in zip(keys, values) for t in pair)
+
+
+def build_calibration_inputs(
+    model,
+    modules: Sequence[nn.Module],
+    max_cache_len: int,
+    device: str,
+    num_sequences: int,
+    seq_len: int,
+    seed: int = 1234,
+) -> List[List[tuple[torch.Tensor, ...]]]:
+    """Generate realistic per-shard calibration inputs for PT2E quantization.
+
+    PT2E observers must see real activation ranges; calibrating on all-zero
+    tensors yields degenerate (near-zero) scales. We embed representative tokens
+    and run them through the fp32 shard pipeline across several decode steps so
+    the KV cache fills realistically, recording each shard's true input tuples.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    vocab_size = int(model.config.vocab_size)
+    steps = max(1, min(seq_len, max_cache_len))
+    per_shard_inputs: List[List[tuple[torch.Tensor, ...]]] = [[] for _ in modules]
+
+    for _ in range(max(1, num_sequences)):
+        shard_caches = [
+            allocate_shard_cache_args(model, module, max_cache_len, device, model.dtype)
+            for module in modules
+        ]
+        for step in range(steps):
+            token_ids = torch.randint(0, vocab_size, (1, 1), generator=generator).to(device)
+            position_ids = torch.tensor([[step]], dtype=torch.long, device=device)
+            cache_position = torch.tensor([step], dtype=torch.long, device=device)
+            attention_mask = make_fixed_attention_mask(step + 1, max_cache_len, device)
+            current = get_token_embeddings(model, token_ids, position_ids).to(model.dtype)
+
+            for s_idx, module in enumerate(modules):
+                cache_args = shard_caches[s_idx] if module.has_blocks else ()
+                if is_gpt2_model(model):
+                    shard_args = (current, attention_mask, cache_position, *cache_args)
+                else:
+                    shard_args = (current, attention_mask, position_ids, cache_position, *cache_args)
+                per_shard_inputs[s_idx].append(shard_args)
+                outputs = module(*shard_args)
+                current = outputs[0]
+                if module.has_blocks:
+                    shard_caches[s_idx] = tuple(outputs[1:])
+    return per_shard_inputs
+
+
 def export_to_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
     exported = torch.export.export(module.eval(), args, strict=False)
     executorch_program = to_edge(exported).to_executorch()
@@ -463,7 +556,12 @@ def get_qnn_pt2e_quantizer(pt2e_quantize: str):
     return quantizer, quant_dtype
 
 
-def quantize_module_for_qnn(module: nn.Module, args: tuple, pt2e_quantize: str) -> nn.Module:
+def quantize_module_for_qnn(
+    module: nn.Module,
+    args: tuple,
+    pt2e_quantize: str,
+    calibration_inputs: Sequence[tuple[torch.Tensor, ...]] | None = None,
+) -> nn.Module:
     if prepare_pt2e is None or convert_pt2e is None:
         raise ImportError(
             "PT2E quantization requires torchao. Install Qualcomm ExecuTorch backend dependencies."
@@ -471,7 +569,16 @@ def quantize_module_for_qnn(module: nn.Module, args: tuple, pt2e_quantize: str) 
     quantizer, _ = get_qnn_pt2e_quantizer(pt2e_quantize)
     exported = torch.export.export(module.eval(), args, strict=False)
     prepared = prepare_pt2e(exported.module(), quantizer)
-    prepared(*args)
+
+    calib_set = list(calibration_inputs) if calibration_inputs else [args]
+    if not calibration_inputs:
+        print(
+            "  WARNING: no calibration data provided; calibrating on a single example "
+            "input. Quantization scales may be degenerate."
+        )
+    print(f"  Calibrating observers on {len(calib_set)} sample(s)...")
+    for calib_args in calib_set:
+        prepared(*calib_args)
     return convert_pt2e(prepared)
 
 
@@ -481,13 +588,16 @@ def export_to_qnn_pte(
     output_path: Path,
     pt2e_quantize: str | None = None,
     use_fp16: bool = False,
+    calibration_inputs: Sequence[tuple[torch.Tensor, ...]] | None = None,
 ) -> str:
     ensure_qualcomm_export_available()
 
     export_module = module.eval()
     if pt2e_quantize is not None:
         print(f"Quantizing shard with PT2E recipe: {pt2e_quantize}")
-        export_module = quantize_module_for_qnn(export_module, args, pt2e_quantize)
+        export_module = quantize_module_for_qnn(
+            export_module, args, pt2e_quantize, calibration_inputs=calibration_inputs
+        )
 
     backend_options = generate_htp_compiler_spec(use_fp16=use_fp16)
     compile_spec = generate_qnn_executorch_compiler_spec(
@@ -507,6 +617,7 @@ def export_artifacts(
     use_qnn: bool,
     pt2e_quantize: str | None = None,
     use_fp16: bool = False,
+    calibration_inputs: Sequence[Sequence[tuple[torch.Tensor, ...]]] | None = None,
 ) -> List[ShardArtifactPath]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     paths: List[ShardArtifactPath] = []
@@ -514,12 +625,16 @@ def export_artifacts(
         output_path = (artifact_dir / f"shard_{idx}.pte").resolve()
         if use_qnn:
             print(f"Exporting QNN shard {idx}...")
+            shard_calibration = (
+                calibration_inputs[idx] if calibration_inputs is not None else None
+            )
             path = export_to_qnn_pte(
                 module,
                 args,
                 output_path,
                 pt2e_quantize=pt2e_quantize,
                 use_fp16=use_fp16,
+                calibration_inputs=shard_calibration,
             )
         else:
             path = export_to_pte(module, args, output_path)
@@ -623,6 +738,21 @@ def main() -> None:
         max_cache_len=args.max_cache_len,
         device=args.device,
     )
+    calibration_inputs = None
+    if args.pt2e_quantize:
+        print(
+            f"Building calibration data: {args.calib_sequences} sequence(s) x "
+            f"{min(args.calib_seq_len, args.max_cache_len)} token(s)..."
+        )
+        calibration_inputs = build_calibration_inputs(
+            model=model,
+            modules=modules,
+            max_cache_len=args.max_cache_len,
+            device=args.device,
+            num_sequences=args.calib_sequences,
+            seq_len=args.calib_seq_len,
+        )
+
     export_backend = "qnn:SM8750" if args.qnn else "portable"
     artifact_paths = export_artifacts(
         modules,
@@ -631,6 +761,7 @@ def main() -> None:
         args.qnn,
         pt2e_quantize=args.pt2e_quantize,
         use_fp16=use_fp16,
+        calibration_inputs=calibration_inputs,
     )
     manifest_path = write_manifest(
         artifact_dir=Path(args.artifact_dir),
