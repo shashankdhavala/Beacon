@@ -14,9 +14,7 @@ import java.net.NetworkInterface
 class MainActivity : Activity() {
     private lateinit var logView: TextView
     private lateinit var portInput: EditText
-    private lateinit var appendInput: EditText
-    private lateinit var nextHostInput: EditText
-    private lateinit var nextPortInput: EditText
+    private lateinit var shardIdInput: EditText
     private var server: ActivationServer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -28,7 +26,7 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "Beacon Worker MVP\ndiagnostic persistent TCP build"
+            text = "Beacon Worker MVP\nroute-in-message TCP build"
             textSize = 24f
         }
         root.addView(title)
@@ -47,43 +45,26 @@ class MainActivity : Activity() {
         }
         root.addView(portInput)
 
-        appendInput = EditText(this).apply {
+        shardIdInput = EditText(this).apply {
             setText("1")
-            hint = "Append suffix for text route, e.g. 1 or 2"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT
-        }
-        root.addView(appendInput)
-
-        nextHostInput = EditText(this).apply {
-            hint = "Next phone IP (leave blank on last phone)"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT
-        }
-        root.addView(nextHostInput)
-
-        nextPortInput = EditText(this).apply {
-            setText("9000")
-            hint = "Next phone port"
+            hint = "Shard ID, e.g. 1 or 2"
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
-        root.addView(nextPortInput)
+        root.addView(shardIdInput)
 
         val startButton = Button(this).apply {
             text = "Start Worker Server"
             setOnClickListener {
                 val port = portInput.text.toString().toIntOrNull() ?: 9000
-                val appendSuffix = appendInput.text.toString()
-                val nextHost = nextHostInput.text.toString().trim().ifBlank { null }
-                val nextPort = nextPortInput.text.toString().toIntOrNull() ?: 9000
+                val shardId = shardIdInput.text.toString().toIntOrNull() ?: 1
                 server?.stop()
                 server = ActivationServer(
                     port = port,
-                    appendSuffix = appendSuffix,
-                    nextHost = nextHost,
-                    nextPort = nextPort,
+                    shardId = shardId,
                 ) { line -> appendLog(line) }
                 server?.start()
                 appendLog("Use tensor test: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port")
-                appendLog("Use text route: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port --message hello")
+                appendLog("Use text route from coordinator with --route \"$shardId=${preferredLocalIpv4Address()}:$port\"")
             }
         }
         root.addView(startButton)

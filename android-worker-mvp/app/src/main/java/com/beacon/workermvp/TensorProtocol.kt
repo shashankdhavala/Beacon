@@ -17,6 +17,7 @@ data class TensorPayload(
     val bytes: ByteArray,
     val responseMode: String = "echo",
     val includeChecksum: Boolean = true,
+    val route: String = "",
 ) {
     fun toHeaderJson(): JSONObject {
         return JSONObject()
@@ -30,6 +31,7 @@ data class TensorPayload(
             .put("byteLength", bytes.size)
             .put("sha256", if (includeChecksum) sha256Hex(bytes) else "")
             .put("responseMode", responseMode)
+            .put("route", route)
             .put("createdAtMs", System.currentTimeMillis())
     }
 
@@ -37,7 +39,7 @@ data class TensorPayload(
         val checksum = if (includeChecksum) sha256Hex(bytes).take(12) else "disabled"
         return "type=$messageType request=$requestId step=$step " +
             "source=$sourceShard target=$targetShard shape=${shape.contentToString()} " +
-            "dtype=$dtype bytes=${bytes.size} sha256=$checksum responseMode=$responseMode"
+            "dtype=$dtype bytes=${bytes.size} sha256=$checksum responseMode=$responseMode routeBytes=${route.length}"
     }
 }
 
@@ -75,6 +77,7 @@ object TensorProtocol {
             bytes = body,
             responseMode = header.optString("responseMode", "echo"),
             includeChecksum = expectedSha.isNotEmpty(),
+            route = header.optString("route", ""),
         )
     }
 

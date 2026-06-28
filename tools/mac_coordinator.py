@@ -37,6 +37,7 @@ class TensorMessage:
     bytes_data: bytes
     response_mode: str = "echo"
     checksum: str = "sha256"
+    route: str = ""
 
     def header(self) -> dict[str, Any]:
         header = {
@@ -49,6 +50,7 @@ class TensorMessage:
             "dtype": self.dtype,
             "byteLength": len(self.bytes_data),
             "responseMode": self.response_mode,
+            "route": self.route,
             "createdAtMs": int(time.time() * 1000),
         }
         header["sha256"] = sha256_hex(self.bytes_data) if self.checksum == "sha256" else ""
@@ -102,9 +104,18 @@ def fake_fp16_tensor_bytes(num_values: int) -> bytes:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Send a fake tensor or text route message to Android workers.")
-    parser.add_argument("--host", required=True, help="Android phone IP address shown in the worker app")
+    parser.add_argument("--host", help="Android phone IP address shown in the worker app")
     parser.add_argument("--port", type=int, default=9000, help="Android worker port")
     parser.add_argument("--message", help="Send this UTF-8 text instead of a fake tensor, e.g. hello")
+    parser.add_argument(
+        "--tokenize-message",
+        action="store_true",
+        help="Split --message on whitespace and send each token through the worker chain",
+    )
+    parser.add_argument(
+        "--route",
+        help='Shard route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"',
+    )
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--dtype", default="fp16", choices=["fp16", "float16"])
@@ -115,6 +126,13 @@ def main() -> None:
     parser.add_argument("--response-mode", default="echo", choices=["echo", "ack"], help="Android response body mode")
     parser.add_argument("--checksum", default="sha256", choices=["sha256", "none"], help="Checksum mode")
     args = parser.parse_args()
+
+    if args.tokenize_message:
+        run_token_route(args)
+        return
+
+    if not args.host:
+        raise SystemExit("--host is required unless --tokenize-message is used with --route")
 
     shape = [1, args.seq_len, args.hidden_size]
     num_values = 1
@@ -216,13 +234,13 @@ def run_one_iteration(
     try:
         response_header, response_body, elapsed_ms = run_trial(args, msg, persistent_sock)
     except TimeoutError:
-        print_connection_help(args.host, args.port, "connection timed out")
+        print_connection_help(first_host, first_port, "connection timed out")
         sys.exit(2)
     except OSError as error:
         reason = error.strerror or str(error)
         if error.errno == errno.ECONNREFUSED:
             reason = "connection refused"
-        print_connection_help(args.host, args.port, reason)
+        print_connection_help(first_host, first_port, reason)
         sys.exit(2)
 
     latencies_ms.append(elapsed_ms)
@@ -235,6 +253,92 @@ def run_one_iteration(
     print(f"round_trip_ms={elapsed_ms:.2f}")
     if trial != args.repeat - 1 and args.delay_ms > 0:
         time.sleep(args.delay_ms / 1000.0)
+
+
+def run_token_route(args: argparse.Namespace) -> None:
+    if not args.message:
+        raise SystemExit("--tokenize-message requires --message")
+    if not args.route:
+        raise SystemExit('--tokenize-message requires --route, e.g. "1=10.0.0.11:9000,2=10.0.0.12:9000"')
+
+    tokens = args.message.split()
+    if not tokens:
+        raise SystemExit("--message did not contain any whitespace-delimited tokens")
+
+    route = parse_route(args.route)
+    if not route:
+        raise SystemExit("--route did not contain any shard entries")
+    first_shard, first_host, first_port = route[0]
+    route_json = json.dumps(
+        [{"shardId": shard_id, "host": host, "port": port} for shard_id, host, port in route],
+        separators=(",", ":"),
+    )
+
+    received: list[str] = []
+    try:
+        with socket.create_connection((first_host, first_port), timeout=args.timeout) as sock:
+            sock.settimeout(args.timeout)
+            configure_socket(sock)
+            for step, token in enumerate(tokens):
+                body = token.encode("utf-8")
+                msg = TensorMessage(
+                    message_type="TEXT",
+                    request_id=f"mac-token-{int(time.time() * 1000)}-{step}",
+                    step=step,
+                    source_shard=0,
+                    target_shard=first_shard,
+                    shape=[len(body)],
+                    dtype="utf8",
+                    bytes_data=body,
+                    response_mode="echo",
+                    checksum=args.checksum,
+                    route=route_json,
+                )
+                send_tensor(sock, msg)
+                header, response_body = recv_tensor(sock)
+                if header.get("dtype") != "utf8":
+                    raise ValueError(f"expected utf8 response, got {header.get('dtype')}")
+                text = response_body.decode("utf-8")
+                received.append(text)
+    except TimeoutError:
+        print_connection_help(args.host, args.port, "connection timed out")
+        sys.exit(2)
+    except OSError as error:
+        reason = error.strerror or str(error)
+        if error.errno == errno.ECONNREFUSED:
+            reason = "connection refused"
+        print_connection_help(args.host, args.port, reason)
+        sys.exit(2)
+
+    print("".join(received))
+
+
+def parse_route(route_arg: str) -> list[tuple[int, str, int]]:
+    route: list[tuple[int, str, int]] = []
+    for raw_entry in route_arg.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise SystemExit(f"invalid route entry {entry!r}; expected shard=host:port")
+        shard_text, address = entry.split("=", 1)
+        try:
+            shard_id = int(shard_text)
+        except ValueError as error:
+            raise SystemExit(f"invalid shard id in route entry {entry!r}") from error
+        if ":" in address:
+            host, port_text = address.rsplit(":", 1)
+            try:
+                port = int(port_text)
+            except ValueError as error:
+                raise SystemExit(f"invalid port in route entry {entry!r}") from error
+        else:
+            host = address
+            port = 9000
+        if not host:
+            raise SystemExit(f"missing host in route entry {entry!r}")
+        route.append((shard_id, host, port))
+    return route
 
 
 def run_trial(

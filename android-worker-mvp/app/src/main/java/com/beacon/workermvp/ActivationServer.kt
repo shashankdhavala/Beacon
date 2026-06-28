@@ -1,5 +1,6 @@
 package com.beacon.workermvp
 
+import org.json.JSONArray
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
@@ -10,9 +11,7 @@ import kotlin.concurrent.thread
 
 class ActivationServer(
     private val port: Int,
-    private val appendSuffix: String,
-    private val nextHost: String?,
-    private val nextPort: Int,
+    private val shardId: Int,
     private val connectTimeoutMs: Int = 5_000,
     private val log: (String) -> Unit,
 ) {
@@ -26,12 +25,7 @@ class ActivationServer(
             try {
                 ServerSocket(port).use { server ->
                     serverSocket = server
-                    val route = if (nextHost.isNullOrBlank()) {
-                        "terminal node"
-                    } else {
-                        "forwarding to $nextHost:$nextPort"
-                    }
-                    log("Worker listening on port $port (diagnostic persistent mode, append='$appendSuffix', $route)")
+                    log("Worker listening on port $port (route-in-message mode, shard=$shardId)")
 
                     while (running.get()) {
                         val socket = server.accept()
@@ -107,27 +101,53 @@ class ActivationServer(
 
     private fun handleTextRoute(request: TensorPayload): TensorPayload {
         val incomingText = request.bytes.toString(Charsets.UTF_8)
-        val appendedText = incomingText + appendSuffix
+        val appendedText = incomingText + shardId
         val appendedBytes = appendedText.toByteArray(Charsets.UTF_8)
         log("Text route: '$incomingText' -> '$appendedText'")
+
+        val route = parseRoute(request.route)
+        val currentIndex = route.indexOfFirst { it.shardId == shardId }
+        val nextHop = if (currentIndex >= 0) route.getOrNull(currentIndex + 1) else null
 
         val appendedPayload = request.copy(
             messageType = "TEXT",
             step = request.step + 1,
-            sourceShard = request.targetShard,
-            targetShard = request.targetShard + 1,
+            sourceShard = shardId,
+            targetShard = nextHop?.shardId ?: 0,
             shape = intArrayOf(appendedBytes.size),
             dtype = "utf8",
             bytes = appendedBytes,
         )
 
-        val host = nextHost?.takeIf { it.isNotBlank() }
-        if (host == null) {
+        if (route.isEmpty()) {
+            log("No route metadata; returning as terminal shard")
             return appendedPayload.copy(messageType = "RESULT")
         }
 
-        log("Forwarding text request=${request.requestId} to $host:$nextPort")
-        return forwardOnce(host, nextPort, appendedPayload)
+        if (currentIndex < 0) {
+            log("Shard $shardId not found in route; returning as terminal shard")
+            return appendedPayload.copy(messageType = "RESULT")
+        }
+
+        if (nextHop == null) {
+            return appendedPayload.copy(messageType = "RESULT")
+        }
+
+        log("Forwarding text request=${request.requestId} to shard ${nextHop.shardId} at ${nextHop.host}:${nextHop.port}")
+        return forwardOnce(nextHop.host, nextHop.port, appendedPayload)
+    }
+
+    private fun parseRoute(routeJson: String): List<RouteHop> {
+        if (routeJson.isBlank()) return emptyList()
+        val array = JSONArray(routeJson)
+        return List(array.length()) { index ->
+            val item = array.getJSONObject(index)
+            RouteHop(
+                shardId = item.getInt("shardId"),
+                host = item.getString("host"),
+                port = item.optInt("port", 9000),
+            )
+        }
     }
 
     private fun forwardOnce(host: String, port: Int, payload: TensorPayload): TensorPayload {
@@ -148,3 +168,9 @@ class ActivationServer(
         }
     }
 }
+
+data class RouteHop(
+    val shardId: Int,
+    val host: String,
+    val port: Int,
+)
