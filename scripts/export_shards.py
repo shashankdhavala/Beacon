@@ -13,7 +13,7 @@ from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-from executorch.exir import to_edge
+from executorch.exir import EdgeCompileConfig, to_edge
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 
@@ -72,10 +72,10 @@ class FixedSizeTensorCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         slot = self.layer_to_slot[layer_idx]
         layer = self.layers[slot]
-        new_keys = layer.keys.clone()
-        new_values = layer.values.clone()
-        new_keys.index_copy_(2, self.cache_position, key_states.contiguous())
-        new_values.index_copy_(2, self.cache_position, value_states.contiguous())
+        new_keys = layer.keys
+        new_values = layer.values
+        new_keys.index_copy_(2, self.cache_position, key_states)
+        new_values.index_copy_(2, self.cache_position, value_states)
         layer.keys = new_keys
         layer.values = new_values
         return layer.keys, layer.values
@@ -117,7 +117,7 @@ class GPT2DecodeOnlyShard(nn.Module):
     def _flatten_cache(cache: FixedSizeTensorCache) -> tuple[torch.Tensor, ...]:
         flat: List[torch.Tensor] = []
         for layer in cache.layers:
-            flat.extend([layer.keys.contiguous(), layer.values.contiguous()])
+            flat.extend([layer.keys, layer.values])
         return tuple(flat)
 
     def forward(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -150,8 +150,7 @@ class GPT2DecodeOnlyShard(nn.Module):
         else:
             cache_outputs = ()
 
-        output = hidden_states.contiguous()
-        return (output, *cache_outputs)
+        return (hidden_states, *cache_outputs)
 
 
 @dataclass
@@ -252,7 +251,10 @@ def build_export_examples(
 
 def export_to_pte(module: nn.Module, args: tuple, output_path: Path) -> str:
     exported = torch.export.export(module.eval(), args, strict=False)
-    executorch_program = to_edge(exported).to_executorch()
+    executorch_program = to_edge(
+        exported,
+        compile_config=EdgeCompileConfig(_skip_dim_order=True),
+    ).to_executorch()
     with open(output_path, "wb") as fp:
         executorch_program.write_to_file(fp)
     return str(output_path)

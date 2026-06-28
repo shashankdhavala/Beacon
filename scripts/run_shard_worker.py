@@ -57,6 +57,30 @@ def receive_message(sock: socket.socket) -> Dict[str, Any]:
     return torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
 
 
+def resolve_artifact_path(manifest: dict, shard_info: dict) -> Path:
+    artifact_dir = Path(manifest["artifact_dir"]).expanduser()
+    if not artifact_dir.exists():
+        artifact_dir = Path(manifest.get("manifest_dir", "."))
+
+    raw_path = Path(shard_info["artifact_path"]).expanduser()
+    candidates = []
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+        candidates.append(artifact_dir / raw_path.name)
+    else:
+        candidates.append(artifact_dir / raw_path)
+        candidates.append(raw_path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        f"could not resolve artifact for shard {shard_info.get('shard_index')}: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
 class ShardWorker:
     def __init__(
         self,
@@ -76,9 +100,7 @@ class ShardWorker:
         self.head_dim = int(shard_info["head_dim"])
         self.cache_dtype = getattr(torch, shard_info["cache_dtype"])
         self.device = device
-        artifact_path = Path(shard_info["artifact_path"])
-        if not artifact_path.is_absolute():
-            artifact_path = (Path(manifest["artifact_dir"]) / artifact_path).resolve()
+        artifact_path = resolve_artifact_path(manifest, shard_info)
         self.shard = portable_lib._load_for_executorch(str(artifact_path))
         self.kv_cache: tuple[torch.Tensor, ...] | None = None
         self.downstream_host = downstream_host
@@ -163,8 +185,22 @@ class ShardWorker:
         cache_position = torch.tensor([step], dtype=torch.long, device=self.device)
         cache = self.require_cache()
         outputs = self.shard.forward((hidden_states, attention_mask, cache_position, *cache))
-        self.kv_cache = tuple(t.to(self.device) for t in outputs[1:])
-        current = outputs[0].to(self.device)
+        hidden_index = next(
+            (index for index, tensor in enumerate(outputs) if tuple(tensor.shape) == tuple(hidden_states.shape)),
+            None,
+        )
+        if hidden_index is None:
+            hidden_index = next((index for index, tensor in enumerate(outputs) if len(tensor.shape) == 3), None)
+        if hidden_index is None:
+            raise RuntimeError(f"shard_{self.shard_index} did not return a hidden tensor; outputs={[tuple(t.shape) for t in outputs]}")
+
+        cache_tensors = [
+            tensor.to(self.device)
+            for index, tensor in enumerate(outputs)
+            if index != hidden_index and len(tensor.shape) == 4
+        ][: self.num_layers * 2]
+        self.kv_cache = tuple(cache_tensors)
+        current = outputs[hidden_index].to(self.device)
         if self.is_last:
             self.log(f"produced hidden_states for master: shape={tuple(current.shape)}")
             return {"type": "step_result", "hidden_states": current.cpu()}
@@ -198,6 +234,7 @@ def main() -> None:
     args = parse_args()
     manifest_path = Path(args.artifact_dir) / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    manifest["manifest_dir"] = str(manifest_path.parent.resolve())
 
     worker = ShardWorker(
         manifest=manifest,

@@ -24,3 +24,7 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    implementation("org.pytorch:executorch-android:0.6.0")
+}

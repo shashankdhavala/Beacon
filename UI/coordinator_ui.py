@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from android_gpt2_coordinator import execute_gpt2_route
 from mac_coordinator import execute_text_route, parse_route
 
 
@@ -501,7 +502,7 @@ HTML = r"""<!doctype html>
             <button class="sample" type="button" data-sample="Translate hello">Translate hello</button>
           </div>
           <button id="runButton" type="submit">Run Through Shards</button>
-          <div class="hint">Current demo mode uses shard-id transforms. The same route later calls the on-device shard runtime.</div>
+          <div class="hint">Launch with <code>--mode gpt2</code> to run one-token hidden states through the on-device shard runtime.</div>
         </form>
       </section>
 
@@ -552,15 +553,31 @@ HTML = r"""<!doctype html>
     }
 
     function renderResult(data) {
-      const rows = data.trials.map((trial) => `
-        <tr>
-          <td>${trial.step}</td>
-          <td><code>${escapeHtml(trial.token)}</code></td>
-          <td><code>${escapeHtml(trial.received)}</code></td>
-          <td>${fmtMs(trial.latencyMs)}</td>
-          <td>${trial.requestBytes} / ${trial.responseBytes}</td>
-        </tr>
-      `).join("");
+      const isGpt2 = data.mode === "gpt2";
+      const rows = data.trials.map((trial) => {
+        if (isGpt2) {
+          return `
+            <tr>
+              <td>${trial.step}</td>
+              <td>${escapeHtml(trial.phase)} ${trial.kept ? "kept" : "discarded"}</td>
+              <td><code>${escapeHtml(trial.inputTokenText)}</code></td>
+              <td><code>${escapeHtml(trial.predictedTokenText)}</code></td>
+              <td>${fmtMs(trial.latencyMs)}</td>
+              <td>${trial.requestBytes} / ${trial.responseBytes}</td>
+            </tr>
+          `;
+        }
+        return `
+          <tr>
+            <td>${trial.step}</td>
+            <td>route</td>
+            <td><code>${escapeHtml(trial.token)}</code></td>
+            <td><code>${escapeHtml(trial.received)}</code></td>
+            <td>${fmtMs(trial.latencyMs)}</td>
+            <td>${trial.requestBytes} / ${trial.responseBytes}</td>
+          </tr>
+        `;
+      }).join("");
 
       const route = data.routeHops.map((hop, index) => `
         ${index > 0 ? '<span class="arrow">to</span>' : ''}
@@ -581,18 +598,19 @@ HTML = r"""<!doctype html>
         </div>
         <div class="tab-panel" data-panel="metrics">
           <div class="metrics">
-            <div class="metric"><div class="name">Tokens</div><div class="value">${data.tokens.length}</div></div>
+            <div class="metric"><div class="name">Tokens</div><div class="value">${isGpt2 ? data.generatedTokenIds.length : data.tokens.length}</div></div>
             <div class="metric"><div class="name">p50</div><div class="value">${fmtMs(data.summary.p50Ms)}</div></div>
             <div class="metric"><div class="name">p95</div><div class="value">${fmtMs(data.summary.p95Ms)}</div></div>
-            <div class="metric"><div class="name">Status</div><div class="value">PASS</div></div>
+            <div class="metric"><div class="name">Mode</div><div class="value">${isGpt2 ? "GPT-2" : "TEXT"}</div></div>
           </div>
           <div class="path"><span class="node"><strong>C</strong>Coordinator</span><span class="arrow">to</span>${route}<span class="arrow">to</span><span class="node"><strong>C</strong>Coordinator</span></div>
           <table>
             <thead>
               <tr>
                 <th>Step</th>
-                <th>Token</th>
-                <th>Coordinator Received</th>
+                <th>Phase</th>
+                <th>Input</th>
+                <th>${isGpt2 ? "Predicted" : "Coordinator Received"}</th>
                 <th>Latency</th>
                 <th>Bytes</th>
               </tr>
@@ -659,6 +677,9 @@ class CoordinatorUiHandler(BaseHTTPRequestHandler):
     server_version = "BeaconCoordinatorUI/0.2"
     route: str = ""
     timeout: float = 10.0
+    mode: str = "text"
+    artifact_dir: str = "artifacts/tiny-gpt2"
+    max_new_tokens: int = 8
 
     def do_GET(self) -> None:
         if self.path not in ("/", "/index.html"):
@@ -679,12 +700,23 @@ class CoordinatorUiHandler(BaseHTTPRequestHandler):
         try:
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             payload = json.loads(body.decode("utf-8"))
-            result = execute_text_route(
-                route_arg=self.route,
-                message=str(payload.get("message", "")),
-                checksum="none",
-                timeout=self.timeout,
-            )
+            message = str(payload.get("message", ""))
+            if self.mode == "gpt2":
+                result = execute_gpt2_route(
+                    route_arg=self.route,
+                    prompt=message,
+                    artifact_dir=self.artifact_dir,
+                    max_new_tokens=self.max_new_tokens,
+                    checksum="none",
+                    timeout=self.timeout,
+                )
+            else:
+                result = execute_text_route(
+                    route_arg=self.route,
+                    message=message,
+                    checksum="none",
+                    timeout=self.timeout,
+                )
             self.send_json(result)
         except Exception as error:
             self.send_json({"ok": False, "error": str(error)}, status=400)
@@ -707,15 +739,22 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--mode", choices=["text", "gpt2"], default="text")
+    parser.add_argument("--artifact-dir", default="artifacts/tiny-gpt2")
+    parser.add_argument("--max-new-tokens", type=int, default=8)
     args = parser.parse_args()
 
     parse_route(args.route)
     CoordinatorUiHandler.route = args.route
     CoordinatorUiHandler.timeout = args.timeout
+    CoordinatorUiHandler.mode = args.mode
+    CoordinatorUiHandler.artifact_dir = args.artifact_dir
+    CoordinatorUiHandler.max_new_tokens = args.max_new_tokens
 
     server = ThreadingHTTPServer((args.host, args.port), CoordinatorUiHandler)
     print(f"Beacon Coordinator UI running at http://{args.host}:{args.port}")
     print(f"Route: {args.route}")
+    print(f"Mode: {args.mode}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

@@ -26,7 +26,7 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "Beacon Worker MVP\nroute-in-message TCP build"
+            text = "Beacon Worker MVP\nTiny GPT-2 shard runtime"
             textSize = 24f
         }
         root.addView(title)
@@ -58,13 +58,26 @@ class MainActivity : Activity() {
                 val port = portInput.text.toString().toIntOrNull() ?: 9000
                 val shardId = shardIdInput.text.toString().toIntOrNull() ?: 1
                 server?.stop()
+                val runtime = try {
+                    ModelShardRuntime(
+                        context = this@MainActivity,
+                        assetDir = "tiny-gpt2",
+                        routeShardId = shardId,
+                    ) { line -> appendLog(line) }
+                } catch (error: Exception) {
+                    appendLog("Model runtime unavailable: ${error.message}")
+                    appendLog("Worker will still run networking routes, but STEP_HIDDEN will pass through unchanged.")
+                    null
+                }
                 server = ActivationServer(
                     port = port,
                     shardId = shardId,
+                    modelRuntime = runtime,
                 ) { line -> appendLog(line) }
                 server?.start()
                 appendLog("Use tensor test: python3 tools/mac_coordinator.py --host ${preferredLocalIpv4Address()} --port $port")
                 appendLog("Use text route from coordinator with --route \"$shardId=${preferredLocalIpv4Address()}:$port\"")
+                appendLog("Use GPT-2 route with shard id $shardId in tools/android_gpt2_coordinator.py")
             }
         }
         root.addView(startButton)
@@ -125,7 +138,7 @@ class MainActivity : Activity() {
             val addresses = networkInterface.inetAddresses.toList()
             for (address in addresses) {
                 if (address is Inet4Address && !address.isLoopbackAddress) {
-                    result += AddressInfo(networkInterface.name, address.hostAddress)
+                    result += AddressInfo(networkInterface.name, address.hostAddress ?: continue)
                 }
             }
         }

@@ -12,7 +12,8 @@ import kotlin.concurrent.thread
 class ActivationServer(
     private val port: Int,
     private val shardId: Int,
-    private val connectTimeoutMs: Int = 5_000,
+    private val modelRuntime: ModelShardRuntime? = null,
+    private val connectTimeoutMs: Int = 30_000,
     private val log: (String) -> Unit,
 ) {
     private val running = AtomicBoolean(false)
@@ -77,18 +78,37 @@ class ActivationServer(
                         val receiveMs = (System.nanoTime() - startedAt) / 1_000_000.0
                         log("Received ${request.summary()} read_ms=${"%.2f".format(receiveMs)}")
 
-                        val response = if (request.messageType == "TEXT") {
-                            handleTextRoute(request)
-                        } else if (request.messageType == "TENSOR" && request.route.isNotBlank()) {
-                            handleTensorRoute(request)
-                        } else {
-                            // MVP behavior: echo the exact tensor bytes back as a RESULT.
-                            // Later this is where ExecuTorch shard B will run.
+                        val response = try {
+                            if (request.messageType == "TEXT") {
+                                handleTextRoute(request)
+                            } else if (request.messageType == "START_REQUEST") {
+                                handleModelControlRoute(request, start = true)
+                            } else if (request.messageType == "FLUSH_REQUEST") {
+                                handleModelControlRoute(request, start = false)
+                            } else if (request.messageType == "STEP_HIDDEN") {
+                                handleStepHiddenRoute(request)
+                            } else if (request.messageType == "TENSOR" && request.route.isNotBlank()) {
+                                handleTensorRoute(request)
+                            } else {
+                                // MVP behavior: echo the exact tensor bytes back as a RESULT.
+                                request.copy(
+                                    messageType = "RESULT",
+                                    sourceShard = request.targetShard,
+                                    targetShard = request.sourceShard,
+                                    bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
+                                )
+                            }
+                        } catch (error: Exception) {
+                            val message = "Worker shard $shardId failed ${request.messageType}: ${error.message}"
+                            log(message)
                             request.copy(
-                                messageType = "RESULT",
-                                sourceShard = request.targetShard,
+                                messageType = "ERROR",
+                                sourceShard = shardId,
                                 targetShard = request.sourceShard,
-                                bytes = if (request.responseMode == "ack") ByteArray(0) else request.bytes,
+                                shape = intArrayOf(message.toByteArray(Charsets.UTF_8).size),
+                                dtype = "utf8",
+                                bytes = message.toByteArray(Charsets.UTF_8),
+                                includeChecksum = false,
                             )
                         }
                         TensorProtocol.write(output, response)
@@ -99,6 +119,71 @@ class ActivationServer(
                 }
             }
         }
+    }
+
+    private fun handleModelControlRoute(request: TensorPayload, start: Boolean): TensorPayload {
+        val route = parseRoute(request.route)
+        val currentIndex = route.indexOfFirst { it.shardId == shardId }
+        val nextHop = if (currentIndex >= 0) route.getOrNull(currentIndex + 1) else null
+
+        if (start) {
+            modelRuntime?.startRequest()
+        } else {
+            modelRuntime?.flushRequest()
+        }
+
+        val controlName = if (start) "START_REQUEST" else "FLUSH_REQUEST"
+        val forwardedPayload = request.copy(
+            messageType = controlName,
+            sourceShard = shardId,
+            targetShard = nextHop?.shardId ?: 0,
+            bytes = ByteArray(0),
+            shape = intArrayOf(0),
+            dtype = "control",
+        )
+
+        if (route.isEmpty() || currentIndex < 0 || nextHop == null) {
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        log("Forwarding $controlName request=${request.requestId} to shard ${nextHop.shardId} at ${nextHop.host}:${nextHop.port}")
+        return forwardOnce(nextHop.host, nextHop.port, forwardedPayload)
+    }
+
+    private fun handleStepHiddenRoute(request: TensorPayload): TensorPayload {
+        val route = parseRoute(request.route)
+        val currentIndex = route.indexOfFirst { it.shardId == shardId }
+        val nextHop = if (currentIndex >= 0) route.getOrNull(currentIndex + 1) else null
+
+        val processed = modelRuntime?.runStep(request) ?: request.also {
+            log("No model runtime is loaded; forwarding STEP_HIDDEN bytes unchanged")
+        }
+        val forwardedPayload = processed.copy(
+            messageType = "STEP_HIDDEN",
+            sourceShard = shardId,
+            targetShard = nextHop?.shardId ?: 0,
+        )
+
+        if (route.isEmpty()) {
+            log("No route metadata for STEP_HIDDEN; returning as terminal shard")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        if (currentIndex < 0) {
+            log("Shard $shardId not found in model route; returning as terminal shard")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        if (nextHop == null) {
+            log("Terminal model shard $shardId returning hidden bytes=${processed.bytes.size}")
+            return forwardedPayload.copy(messageType = "RESULT")
+        }
+
+        log(
+            "Forwarding STEP_HIDDEN request=${request.requestId} step=${request.step} " +
+                "bytes=${processed.bytes.size} to shard ${nextHop.shardId} at ${nextHop.host}:${nextHop.port}",
+        )
+        return forwardOnce(nextHop.host, nextHop.port, forwardedPayload)
     }
 
     private fun handleTextRoute(request: TensorPayload): TensorPayload {

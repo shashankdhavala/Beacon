@@ -18,7 +18,7 @@ import socket
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -38,6 +38,7 @@ class TensorMessage:
     response_mode: str = "echo"
     checksum: str = "sha256"
     route: str = ""
+    extra_headers: dict[str, Any] = field(default_factory=dict)
 
     def header(self) -> dict[str, Any]:
         header = {
@@ -53,6 +54,7 @@ class TensorMessage:
             "route": self.route,
             "createdAtMs": int(time.time() * 1000),
         }
+        header.update(self.extra_headers)
         header["sha256"] = sha256_hex(self.bytes_data) if self.checksum == "sha256" else ""
         return header
 
